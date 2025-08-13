@@ -6,7 +6,7 @@ import io
 import re
 from datetime import datetime
 
-# --- HELPER FUNCTIONS (FROM ORIGINAL APP) ---
+# --- HELPER FUNCTIONS FOR 1nHEALTH FORECAST MODEL ---
 
 @st.cache_data
 def parse_funnel_definition(uploaded_file):
@@ -52,14 +52,17 @@ def get_stage_timestamps(row, funnel_def, ordered_stages, ts_col_map):
     return pd.Series(timestamps)
 
 @st.cache_data
-def preprocess_1nhealth_data(_referral_file, _funnel_def_file):
-    """Uses the original app's logic to fully process the 1nHealth referral data."""
+def build_1nhealth_forecast_model(_referral_file, _funnel_def_file):
+    """
+    Reads the 1nHealth files to understand the FUNNEL PROCESS (rates, lags)
+    and returns the processed dataframe of leads for pipeline yield calculation.
+    THIS FUNCTION DOES NOT CARE ABOUT HISTORICAL COUNTS.
+    """
     funnel_def, ordered_stages, ts_col_map = parse_funnel_definition(_funnel_def_file)
     if not funnel_def: raise ValueError("Could not parse Funnel Definition file.")
     
     df = pd.read_csv(_referral_file)
     if 'Lead Stage History' not in df.columns: raise ValueError("1nHealth Referral Data must have 'Lead Stage History'.")
-    if 'Subject ID' not in df.columns: raise ValueError("1nHealth Referral Data must have 'Subject ID'.")
     
     df['Parsed_Lead_Stage_History'] = df['Lead Stage History'].apply(parse_history_string)
     timestamp_df = df.apply(lambda row: get_stage_timestamps(row, funnel_def, ordered_stages, ts_col_map), axis=1)
@@ -77,28 +80,29 @@ def preprocess_1nhealth_data(_referral_file, _funnel_def_file):
     return df, rates, lags, ordered_stages, ts_col_map
 
 @st.cache_data
-def get_historical_summary_and_site_rates(_irt_file, _1nhealth_ids):
-    """Gets all historical counts and site-only rates after reconciling with 1nHealth IDs."""
+def get_historical_summary_and_site_rates(_irt_file):
+    """
+    Gets ALL historical counts and site-only rates from the IRT file.
+    THIS IS THE SINGLE SOURCE OF TRUTH FOR HISTORICALS.
+    """
     df_irt = pd.read_csv(_irt_file)
     df_irt.columns = df_irt.columns.str.strip()
-    if 'Subject ID' not in df_irt.columns: raise ValueError("IRT Report must contain a 'Subject ID' column for reconciliation.")
+    if 'Referral Source' not in df_irt.columns: raise ValueError("IRT Report MUST contain a 'Referral Source' column.")
 
-    # **THE DEFINITIVE FIX: PROGRAMMATIC RECONCILIATION**
-    df_irt['Referral Source'] = np.where(df_irt['Subject ID'].isin(_1nhealth_ids), '1nHealth', 'Site')
-    
     df_irt['ICF_Date'] = pd.to_datetime(df_irt['Informed Consent Date (Local)'], errors='coerce')
     df_irt['Rand_Date'] = pd.to_datetime(df_irt['Randomization Date (Local)'], errors='coerce')
     df_irt.dropna(subset=['ICF_Date'], inplace=True)
+    df_irt['Referral Source'] = df_irt['Referral Source'].str.strip()
     df_irt['ICF_Month'] = df_irt['ICF_Date'].dt.to_period('M')
     df_irt['Rand_Month'] = df_irt['Rand_Date'].dt.to_period('M')
 
-    hist_summary = pd.concat([
+    historical_summary = pd.concat([
         df_irt[df_irt['Referral Source'] == '1nHealth'].groupby('ICF_Month').size().rename('1nHealth ICF Total'),
         df_irt[df_irt['Referral Source'] == '1nHealth'].groupby('Rand_Month').size().rename('1nHealth Rand Total'),
         df_irt[df_irt['Referral Source'] == 'Site'].groupby('ICF_Month').size().rename('Site ICF Total'),
         df_irt[df_irt['Referral Source'] == 'Site'].groupby('Rand_Month').size().rename('Site Rand Total')
     ], axis=1).fillna(0).astype(int)
-    hist_summary.sort_index(inplace=True)
+    historical_summary.sort_index(inplace=True)
 
     df_site_only = df_irt[df_irt['Referral Source'] == 'Site']
     site_rates = {
@@ -106,10 +110,10 @@ def get_historical_summary_and_site_rates(_irt_file, _1nhealth_ids):
         'lag': (df_site_only['Rand_Date'] - df_site_only['ICF_Date']).dt.days.mean(),
         'avg_icf': df_site_only.groupby('ICF_Month').size().mean() if not df_site_only.empty else 0
     }
-    return hist_summary, site_rates
+    return historical_summary, site_rates
 
 # --- FORECASTING ENGINES ---
-# ... (Forecasting functions remain the same as the correct previous version) ...
+# ... (These are now correct because they are fed by the correct data sources) ...
 def calculate_pipeline_yield(df_1nhealth, rates, lags, ordered_stages, ts_col_map, horizon):
     """The 'Funnel Analysis' component: projects yield from in-flight leads."""
     icf_stage = next((s for s in ordered_stages if 'icf' in s.lower()), None)
@@ -184,15 +188,14 @@ with st.sidebar:
     st.header("⚙️ Data Uploads")
     uploaded_referral_file = st.file_uploader("1. 1nHealth Referral Data (with History)")
     uploaded_funnel_def_file = st.file_uploader("2. Funnel Definition (Stage Map)")
-    uploaded_irt_file = st.file_uploader("3. Full IRT Report")
+    uploaded_irt_file = st.file_uploader("3. Full IRT Report (with 'Referral Source')")
 
 if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
     try:
-        df_1nhealth, rates_1nhealth, lags_1nhealth, ordered_stages, ts_col_map = preprocess_1nhealth_data(
+        df_1nhealth, rates_1nhealth, lags_1nhealth, ordered_stages, ts_col_map = build_1nhealth_forecast_model(
             uploaded_referral_file, uploaded_funnel_def_file
         )
-        one_n_health_ids = set(df_1nhealth['Subject ID'].unique())
-        hist_summary, site_rates = get_historical_summary_and_site_rates(uploaded_irt_file, one_n_health_ids)
+        hist_summary, site_rates = get_historical_summary_and_site_rates(uploaded_irt_file)
         
         with st.sidebar:
             st.markdown("---")
@@ -252,5 +255,6 @@ if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
     except Exception as e:
         st.error(f"A critical error occurred: {e}")
         st.exception(e)
+
 else:
     st.info("👋 Welcome! Please upload all three required files to begin.")
