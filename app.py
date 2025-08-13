@@ -27,7 +27,7 @@ STAGE_SCREEN_FAILED = "Screen Failed"
 STAGE_ENROLLED = "Enrolled"
 STAGE_LOST = "Lost"
 
-# ... (All data parsing and preprocessing functions are correct and remain unchanged) ...
+# --- All data parsing and preprocessing functions are correct and remain unchanged ---
 @st.cache_data
 def parse_funnel_definition(uploaded_file):
     if uploaded_file is None: return None, None, None
@@ -41,27 +41,18 @@ def parse_funnel_definition(uploaded_file):
             column_data = df_funnel_def[col_idx]
             stage_name = column_data.iloc[0]
             if pd.isna(stage_name) or str(stage_name).strip() == "": continue
-            
             stage_name = str(stage_name).strip().replace('"', '')
             parsed_ordered_stages.append(stage_name)
-            
             statuses = column_data.iloc[1:].dropna().astype(str).apply(lambda x: x.strip().replace('"', '')).tolist()
             statuses = [s for s in statuses if s]
-            
             if stage_name not in statuses: statuses.append(stage_name)
-                
             parsed_funnel_definition[stage_name] = statuses
             clean_ts_name = f"TS_{stage_name.replace(' ', '_').replace('(', '').replace(')', '')}"
             ts_col_map[stage_name] = clean_ts_name
-            
-        if not parsed_ordered_stages:
-            st.error("Could not parse stages from Funnel Definition. Check file format.")
-            return None, None, None
-            
+        if not parsed_ordered_stages: return None, None, None
         return parsed_funnel_definition, parsed_ordered_stages, ts_col_map
     except Exception as e:
-        st.error(f"Error parsing Funnel Definition file: {e}")
-        return None, None, None
+        st.error(f"Error parsing Funnel Definition file: {e}"); return None, None, None
 
 def parse_datetime_with_timezone(dt_str):
     if pd.isna(dt_str): return pd.NaT
@@ -90,14 +81,13 @@ def parse_history_string(history_str):
 def get_stage_timestamps(row, parsed_stage_history_col, parsed_status_history_col, funnel_def, ordered_stgs, ts_col_mapping):
     timestamps = {ts_col_mapping[stage]: pd.NaT for stage in ordered_stgs}
     status_to_stage_map = {status: stage for stage, statuses in funnel_def.items() for status in statuses} if funnel_def else {}
-    
-    all_events = []; stage_hist = row.get(parsed_stage_history_col, []); status_hist = row.get(parsed_status_history_col, [])
+    all_events = []
+    stage_hist = row.get(parsed_stage_history_col, [])
+    status_hist = row.get(parsed_status_history_col, [])
     if stage_hist: all_events.extend([(name, dt) for name, dt in stage_hist if isinstance(name, str)])
     if status_hist: all_events.extend([(name, dt) for name, dt in status_hist if isinstance(name, str)])
-    
     try: all_events.sort(key=lambda x: x[1] if pd.notna(x[1]) else datetime.min)
     except TypeError: pass
-
     for event_name, event_dt in all_events:
         if pd.isna(event_dt): continue
         event_stage = status_to_stage_map.get(event_name) or (event_name if event_name in ordered_stgs else None)
@@ -105,7 +95,6 @@ def get_stage_timestamps(row, parsed_stage_history_col, parsed_status_history_co
             ts_col_name = ts_col_mapping.get(event_stage)
             if ts_col_name and pd.isna(timestamps[ts_col_name]):
                 timestamps[ts_col_name] = event_dt
-                
     return pd.Series(timestamps, dtype='datetime64[ns]')
 
 @st.cache_data
@@ -114,36 +103,24 @@ def preprocess_referral_data(_df_raw, funnel_def, ordered_stages, ts_col_map):
     df = _df_raw.copy()
     submitted_on_col = "Submitted On" if "Submitted On" in df.columns else "Referral Date"
     if submitted_on_col not in df.columns:
-        st.error("Data must contain either a 'Submitted On' or 'Referral Date' column.")
-        return None
-    
+        st.error("Data must contain either a 'Submitted On' or 'Referral Date' column."); return None
     if "Referral Date" in df.columns: df.rename(columns={"Referral Date": "Submitted On"}, inplace=True)
     df["Submitted On_DT"] = df[submitted_on_col].apply(lambda x: parse_datetime_with_timezone(str(x)))
-    
     initial_rows = len(df)
-    df.dropna(subset=["Submitted On_DT"], inplace=True); rows_dropped = initial_rows - len(df)
-    if rows_dropped > 0: st.warning(f"Dropped {rows_dropped} rows due to unparseable dates.")
-    if df.empty:
-        st.error("No valid data remaining after date parsing."); return None
-
+    df.dropna(subset=["Submitted On_DT"], inplace=True)
+    if initial_rows - len(df) > 0: st.warning(f"Dropped {initial_rows - len(df)} rows due to unparseable dates.")
+    if df.empty: st.error("No valid data remaining after date parsing."); return None
     df["Submission_Month"] = df["Submitted On_DT"].dt.to_period('M')
-    
     parsed_cols = {}
     for col_name in ['Lead Stage History', 'Lead Status History']:
         if col_name in df.columns:
             parsed_col_name = f"Parsed_{col_name.replace(' ', '_')}"
-            df[parsed_col_name] = df[col_name].astype(str).apply(parse_history_string); parsed_cols[col_name] = parsed_col_name
-        else: st.warning(f"History column '{col_name}' not found. Timestamps may be incomplete.")
-
-    parsed_stage_hist_col, parsed_status_hist_col = parsed_cols.get('Lead Stage History'), parsed_cols.get('Lead Status History')
-    if not parsed_stage_hist_col and not parsed_status_hist_col:
-        st.error("Neither 'Lead Stage History' nor 'Lead Status History' found. Cannot determine stage progression.")
-        return None
-
-    timestamp_cols_df = df.apply(lambda row: get_stage_timestamps(row, parsed_stage_hist_col, parsed_status_hist_col, funnel_def, ordered_stages, ts_col_map), axis=1)
-    df = pd.concat([df.drop(columns=[col for col in df.columns if col.startswith('TS_')], errors='ignore'), timestamp_cols_df], axis=1)
-    
-    for stage, ts_col in ts_col_map.items():
+            df[parsed_col_name] = df[col_name].astype(str).apply(parse_history_string)
+            parsed_cols[col_name] = parsed_col_name
+    if not parsed_cols: st.error("Neither 'Lead Stage History' nor 'Lead Status History' found."); return None
+    timestamp_cols_df = df.apply(lambda row: get_stage_timestamps(row, parsed_cols.get('Lead Stage History'), parsed_cols.get('Lead Status History'), funnel_def, ordered_stages, ts_col_map), axis=1)
+    df = pd.concat([df.drop(columns=[c for c in df.columns if c.startswith('TS_')], errors='ignore'), timestamp_cols_df], axis=1)
+    for ts_col in ts_col_map.values():
         if ts_col in df.columns: df[ts_col] = pd.to_datetime(df[ts_col], errors='coerce')
     return df
 
@@ -160,9 +137,9 @@ def calculate_overall_inter_stage_lags(_processed_df, ordered_stages, ts_col_map
     if _processed_df is None or not ordered_stages: return {}
     lags = {}
     for i in range(len(ordered_stages) - 1):
-        stage_from, stage_to = ordered_stages[i], ordered_stages[i+1]
-        ts_from, ts_to = ts_col_map.get(stage_from), ts_col_map.get(stage_to)
-        if ts_from and ts_to: lags[f"{stage_from} -> {stage_to}"] = calculate_avg_lag_generic(_processed_df, ts_from, ts_to)
+        sf, st = ordered_stages[i], ordered_stages[i+1]
+        tsf, tst = ts_col_map.get(sf), ts_col_map.get(st)
+        if tsf and tst: lags[f"{sf} -> {st}"] = calculate_avg_lag_generic(_processed_df, tsf, tst)
     return lags
 
 # --- 3. Core Forecasting and Calculation Functions ---
@@ -172,47 +149,31 @@ def calculate_historical_performance(processed_df, ts_col_map, num_months_histor
     """Calculates actual landed ICFs and Enrollments for past months."""
     if processed_df is None or processed_df.empty or num_months_history <= 0:
         return pd.DataFrame()
-
     historical_start_month = end_month_period - num_months_history
     historical_months_range = pd.period_range(start=historical_start_month, end=end_month_period - 1, freq='M')
     hist_df = pd.DataFrame(index=historical_months_range)
-
     icf_ts_col = ts_col_map.get(STAGE_SIGNED_ICF)
     if icf_ts_col and icf_ts_col in processed_df.columns:
         icf_data = processed_df.dropna(subset=[icf_ts_col])
         icf_counts = icf_data.groupby(icf_data[icf_ts_col].dt.to_period('M')).size()
         hist_df['Total Projected ICFs'] = hist_df.index.map(icf_counts)
-
     enroll_ts_col = ts_col_map.get(STAGE_ENROLLED)
     if enroll_ts_col and enroll_ts_col in processed_df.columns:
         enroll_data = processed_df.dropna(subset=[enroll_ts_col])
         enroll_counts = enroll_data.groupby(enroll_data[enroll_ts_col].dt.to_period('M')).size()
         hist_df['Enrollments from Pipeline'] = hist_df.index.map(enroll_counts)
-        
     return hist_df.fillna(0).astype(int)
 
 @st.cache_data
-def determine_effective_projection_rates(
-    _processed_df, ordered_stages, ts_col_map, rate_method,
-    rolling_window, manual_rates, inter_stage_lags_for_maturity
-):
-    """This is the full, robust function for determining conversion rates."""
-    MIN_DENOMINATOR_FOR_RATE_CALC = 5
-    DEFAULT_MATURITY_DAYS = 45
-    MATURITY_LAG_MULTIPLIER = 1.5
-    MIN_EFFECTIVE_MATURITY_DAYS = 20
-    MIN_TOTAL_DENOMINATOR_FOR_OVERALL_RATE = 20
-
+def determine_effective_projection_rates(_processed_df, ordered_stages, ts_col_map, rate_method, rolling_window, manual_rates, inter_stage_lags_for_maturity):
+    """The full, robust function for determining conversion rates."""
     if rate_method == 'Manual Input Below' or _processed_df is None or _processed_df.empty:
         return manual_rates, "Manual Input"
-
+    
     MATURITY_PERIODS_DAYS = {}
     for rate_key in manual_rates.keys():
         avg_lag = inter_stage_lags_for_maturity.get(rate_key)
-        if pd.notna(avg_lag) and avg_lag > 0:
-            calculated_maturity = round(MATURITY_LAG_MULTIPLIER * avg_lag)
-            MATURITY_PERIODS_DAYS[rate_key] = max(calculated_maturity, MIN_EFFECTIVE_MATURITY_DAYS)
-        else: MATURITY_PERIODS_DAYS[rate_key] = DEFAULT_MATURITY_DAYS
+        MATURITY_PERIODS_DAYS[rate_key] = max(round(1.5 * avg_lag), 20) if pd.notna(avg_lag) and avg_lag > 0 else 45
     
     try:
         hist_counts = _processed_df.groupby("Submission_Month").size().to_frame(name="Total_Submissions")
@@ -228,28 +189,22 @@ def determine_effective_projection_rates(
         for rate_key, manual_val in manual_rates.items():
             try: from_stage, to_stage = rate_key.split(" -> ")
             except ValueError: continue
-
             col_from = f"Reached_{from_stage.replace(' ', '_').replace('(', '').replace(')', '')}"
             col_to = f"Reached_{to_stage.replace(' ', '_').replace('(', '').replace(')', '')}"
-
             if col_from not in hist_counts.columns or col_to not in hist_counts.columns:
                 calculated_rates[rate_key] = manual_val; continue
-
-            maturity_days = MATURITY_PERIODS_DAYS.get(rate_key, DEFAULT_MATURITY_DAYS)
-            mature_months_mask = hist_counts.index.to_timestamp() + pd.Timedelta(days=maturity_days) < pd.Timestamp(datetime.now())
-            mature_hist_counts = hist_counts[mature_months_mask]
             
+            maturity_days = MATURITY_PERIODS_DAYS.get(rate_key, 45)
+            mature_hist_counts = hist_counts[hist_counts.index.to_timestamp() + pd.Timedelta(days=maturity_days) < pd.Timestamp(datetime.now())]
             if mature_hist_counts.empty:
                 calculated_rates[rate_key] = manual_val; continue
-                
-            total_numerator = mature_hist_counts[col_to].sum()
-            total_denominator = mature_hist_counts[col_from].sum()
-            overall_hist_rate = (total_numerator / total_denominator) if total_denominator >= MIN_TOTAL_DENOMINATOR_FOR_OVERALL_RATE else np.nan
+
+            total_denom = mature_hist_counts[col_from].sum()
+            overall_hist_rate = (mature_hist_counts[col_to].sum() / total_denom) if total_denom >= 20 else np.nan
             fallback_rate = overall_hist_rate if pd.notna(overall_hist_rate) else manual_val
             
             monthly_rates = (mature_hist_counts[col_to] / mature_hist_counts[col_from].replace(0, np.nan))
-            monthly_rates = monthly_rates.where(mature_hist_counts[col_from] >= MIN_DENOMINATOR_FOR_RATE_CALC, fallback_rate)
-            monthly_rates.dropna(inplace=True)
+            monthly_rates = monthly_rates.where(mature_hist_counts[col_from] >= 5, fallback_rate).dropna()
 
             if not monthly_rates.empty:
                 win_size = min(rolling_window, len(monthly_rates)) if rolling_window != 999 else len(monthly_rates)
@@ -265,140 +220,108 @@ def determine_effective_projection_rates(
         return manual_rates, f"Manual (Error in Rolling Calc: {e})"
 
 @st.cache_data
-def calculate_projections_from_new_leads(processed_df, ordered_stages, ts_col_map, proj_inputs):
+def calculate_new_lead_projections(processed_df, ordered_stages, ts_col_map, proj_inputs):
     """The full, robust function for projecting outcomes from future ad spend."""
     if processed_df is None: return pd.DataFrame(columns=['ICFs from New Leads'])
-
-    horizon = proj_inputs['horizon']
-    future_spend_dict = proj_inputs['spend_dict']
-    assumed_cpqr_dict = proj_inputs['cpqr_dict']
-    final_conv_rates = proj_inputs['final_conv_rates']
-    inter_stage_lags = proj_inputs.get('inter_stage_lags', {})
-
-    projection_segments = []
+    horizon, future_spend, assumed_cpqr, conv_rates, inter_stage_lags = (
+        proj_inputs['horizon'], proj_inputs['spend_dict'], proj_inputs['cpqr_dict'],
+        proj_inputs['final_conv_rates'], proj_inputs.get('inter_stage_lags', {}))
+    
+    projection_segments, total_lag_to_icf = [], 0
     try:
         icf_idx = ordered_stages.index(STAGE_SIGNED_ICF)
         for i in range(icf_idx):
-            projection_segments.append((ordered_stages[i], ordered_stages[i+1]))
-    except (ValueError, IndexError):
-        return pd.DataFrame(columns=['ICFs from New Leads'])
+            seg = (ordered_stages[i], ordered_stages[i+1])
+            projection_segments.append(seg)
+            total_lag_to_icf += inter_stage_lags.get(f"{seg[0]} -> {seg[1]}", 30)
+    except (ValueError, IndexError): return pd.DataFrame(columns=['ICFs from New Leads'])
 
-    total_lag_to_icf = sum(inter_stage_lags.get(f"{s_from} -> {s_to}", 30) for s_from, s_to in projection_segments)
-    
     last_hist_month = processed_df["Submission_Month"].max() if "Submission_Month" in processed_df else pd.Period(datetime.now(),'M')-1
-    proj_start_month = last_hist_month + 1
-    future_months = pd.period_range(start=proj_start_month, periods=horizon, freq='M')
-
-    projection_cohorts = pd.DataFrame(index=future_months)
-    projection_cohorts['Ad_Spend'] = [future_spend_dict.get(m, 0) for m in future_months]
-    projection_cohorts['CPQR'] = [assumed_cpqr_dict.get(m, 120) for m in future_months]
-    projection_cohorts['New_QLs'] = (projection_cohorts['Ad_Spend'] / projection_cohorts['CPQR'].replace(0, np.nan)).fillna(0).round().astype(int)
-
-    current_stage_counts = projection_cohorts['New_QLs'].copy()
-    for stage_from, stage_to in projection_segments:
-        rate = final_conv_rates.get(f"{stage_from} -> {stage_to}", 0.0)
-        current_stage_counts *= rate
+    start_month = last_hist_month + 1
+    future_months = pd.period_range(start=start_month, periods=horizon, freq='M')
     
-    projection_cohorts['Generated_ICFs'] = current_stage_counts
+    cohorts = pd.DataFrame(index=future_months)
+    cohorts['Ad_Spend'] = [future_spend.get(m, 0) for m in future_months]
+    cohorts['CPQR'] = [assumed_cpqr.get(m, 120) for m in future_months]
+    cohorts['New_QLs'] = (cohorts['Ad_Spend'] / cohorts['CPQR'].replace(0, np.nan)).fillna(0).round().astype(int)
 
-    # Smear generated ICFs into landing months
-    max_land_month = future_months[-1] + int(np.ceil(total_lag_to_icf / 30.5)) + 3
-    results_idx = pd.period_range(start=proj_start_month, end=max_land_month, freq='M')
+    counts = cohorts['New_QLs'].copy()
+    for stage_from, stage_to in projection_segments:
+        counts *= conv_rates.get(f"{stage_from} -> {stage_to}", 0.0)
+    cohorts['Generated_ICFs'] = counts
+
+    max_land = future_months[-1] + int(np.ceil(total_lag_to_icf / 30.5)) + 3
+    results_idx = pd.period_range(start=start_month, end=max_land, freq='M')
     results = pd.DataFrame(0.0, index=results_idx, columns=['ICFs from New Leads'])
 
-    days_in_avg_month = 30.4375
-    for cohort_month, row in projection_cohorts.iterrows():
+    for month, row in cohorts.iterrows():
         if row['Generated_ICFs'] <= 0: continue
-        full_lag_months, rem_days = divmod(total_lag_to_icf, days_in_avg_month)
-        frac_for_next_month = rem_days / days_in_avg_month
-
-        land_month_1 = cohort_month + int(full_lag_months)
-        land_month_2 = land_month_1 + 1
-        
-        if land_month_1 in results.index:
-            results.loc[land_month_1, 'ICFs from New Leads'] += row['Generated_ICFs'] * (1 - frac_for_next_month)
-        if land_month_2 in results.index:
-            results.loc[land_month_2, 'ICFs from New Leads'] += row['Generated_ICFs'] * frac_for_next_month
-
-    return results.reindex(future_months).fillna(0)
+        full_m, rem_d = divmod(total_lag_to_icf, 30.4375)
+        frac_next = rem_d / 30.4375
+        l1, l2 = month + int(full_m), month + int(full_m) + 1
+        if l1 in results.index: results.loc[l1, 'ICFs from New Leads'] += row['Generated_ICFs'] * (1 - frac_next)
+        if l2 in results.index: results.loc[l2, 'ICFs from New Leads'] += row['Generated_ICFs'] * frac_next
+            
+    return results
 
 @st.cache_data
 def calculate_pipeline_projection(_processed_df, ordered_stages, ts_col_map, inter_stage_lags, conv_rates):
-    """Calculates future ICFs and Enrollments from EXISTING in-flight leads."""
-    if _processed_df is None: return {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0}
+    """The working function to calculate yield from the existing pipeline."""
+    default_return = {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0}
+    if _processed_df is None or _processed_df.empty: return default_return
 
-    term_ts = [ts_col_map.get(s) for s in [STAGE_ENROLLED, STAGE_SCREEN_FAILED, STAGE_LOST] if s in ts_col_map]
+    term_stages = [s for s in [STAGE_ENROLLED, STAGE_SCREEN_FAILED, STAGE_LOST] if s in ts_col_map]
+    term_ts_cols = [ts_col_map.get(s) for s in term_stages]
     in_flight = _processed_df.copy()
-    for ts in term_ts:
-        if ts in in_flight.columns: in_flight = in_flight[in_flight[ts].isna()]
-    if in_flight.empty: return {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0}
+    for ts_col in term_ts_cols:
+        if ts_col in in_flight.columns: in_flight = in_flight[in_flight[ts_col].isna()]
+    if in_flight.empty: return default_return
 
-    def get_curr_stage(row, stages, ts_map):
-        last_s, last_t = None, pd.NaT
-        for s in stages:
-            if s in [STAGE_ENROLLED, STAGE_SCREEN_FAILED, STAGE_LOST]: continue
-            ts_col = ts_map.get(s)
-            t = row.get(ts_col) if ts_col else None
-            if ts_col and pd.notna(t) and (pd.isna(last_t) or t > last_t):
-                last_s, last_t = s, t
-        return last_s, last_t
-    in_flight[['curr_s', 'curr_t']] = in_flight.apply(lambda r: get_curr_stage(r,ordered_stages,ts_col_map), axis=1, result_type='expand')
-    in_flight.dropna(subset=['curr_s'], inplace=True)
+    def get_current_stage(row, stages, ts_map):
+        last_stage, last_ts = None, pd.NaT
+        for stage in stages:
+            if stage in term_stages: continue
+            ts_col = ts_map.get(stage)
+            if ts_col and ts_col in row and pd.notna(row[ts_col]):
+                if pd.isna(last_ts) or row[ts_col] > last_ts:
+                    last_ts, last_stage = row[ts_col], stage
+        return last_stage
+    
+    in_flight['current_stage'] = in_flight.apply(lambda row: get_current_stage(row, ordered_stages, ts_col_map), axis=1)
+    in_flight['current_stage_ts'] = in_flight.apply(lambda row: row.get(ts_col_map.get(row['current_stage'])) if row['current_stage'] else pd.NaT, axis=1)
+    in_flight.dropna(subset=['current_stage', 'current_stage_ts'], inplace=True)
 
-    projs = []
+    projections = []
     icf_idx = ordered_stages.index(STAGE_SIGNED_ICF) if STAGE_SIGNED_ICF in ordered_stages else -1
-    if icf_idx == -1: return {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0}
+    if icf_idx == -1: return default_return
 
     for _, row in in_flight.iterrows():
-        prob_to_icf, lag_to_icf = 1.0, 0.0
-        start_idx = ordered_stages.index(row['curr_s'])
-        
-        path_found = False
-        for i in range(start_idx, len(ordered_stages)-1):
+        prob, lag = 1.0, 0.0
+        start_idx = ordered_stages.index(row['current_stage'])
+        for i in range(start_idx, icf_idx):
             f, t = ordered_stages[i], ordered_stages[i+1]
-            prob_to_icf *= conv_rates.get(f"{f} -> {t}", 0)
-            lag_to_icf += inter_stage_lags.get(f"{f} -> {t}", 0)
-            if t == STAGE_SIGNED_ICF: path_found = True; break
+            prob *= conv_rates.get(f"{f} -> {t}", 0)
+            lag += inter_stage_lags.get(f"{f} -> {t}", 0)
         
-        if path_found and prob_to_icf > 0 and pd.notna(row['curr_t']):
-            icf_date = row['curr_t'] + pd.to_timedelta(lag_to_icf, unit='D')
-            prob_to_enroll = prob_to_icf * conv_rates.get(f"{STAGE_SIGNED_ICF} -> {STAGE_ENROLLED}", 0.0)
-            lag_to_enroll = inter_stage_lags.get(f"{STAGE_SIGNED_ICF} -> {STAGE_ENROLLED}", 0.0)
-            enroll_date = icf_date + pd.to_timedelta(lag_to_enroll, unit='D') if pd.notna(icf_date) else pd.NaT
-            projs.append({'icf_prob':prob_to_icf, 'icf_date':icf_date, 'enroll_prob':prob_to_enroll, 'enroll_date':enroll_date})
+        if prob > 0:
+            icf_date = row['current_stage_ts'] + pd.to_timedelta(lag, unit='D')
+            enroll_prob = prob * conv_rates.get(f"{STAGE_SIGNED_ICF} -> {STAGE_ENROLLED}", 0)
+            enroll_lag = lag + inter_stage_lags.get(f"{STAGE_SIGNED_ICF} -> {STAGE_ENROLLED}", 0)
+            enroll_date = row['current_stage_ts'] + pd.to_timedelta(enroll_lag, unit='D')
+            projections.append({'icf_prob': prob, 'icf_date': icf_date, 'enroll_prob': enroll_prob, 'enroll_date': enroll_date})
     
-    if not projs: return {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0}
-
-    proj_df = pd.DataFrame(projs)
-    max_d = proj_df[['icf_date', 'enroll_date']].max().max() if not proj_df.empty else datetime.now()
-    start_p, end_p = pd.Period(datetime.now(), 'M'), max(pd.Period(max_d, 'M'), pd.Period(datetime.now(), 'M') + 24)
+    if not projections: return default_return
+    proj_df = pd.DataFrame(projections)
+    
+    max_date = proj_df[['icf_date', 'enroll_date']].max().max() if not proj_df.empty else datetime.now()
+    start_p, end_p = pd.Period(datetime.now(), 'M'), max(pd.Period(max_date, 'M'), pd.Period(datetime.now(), 'M') + 24)
     res_idx = pd.period_range(start=start_p, end=end_p, freq='M')
     res_df = pd.DataFrame(0.0, index=res_idx, columns=['ICFs from Pipeline', 'Enrollments from Pipeline'])
 
     res_df['ICFs from Pipeline'] = res_df.index.map(proj_df.groupby(proj_df['icf_date'].dt.to_period('M'))['icf_prob'].sum())
     res_df['Enrollments from Pipeline'] = res_df.index.map(proj_df.groupby(proj_df['enroll_date'].dt.to_period('M'))['enroll_prob'].sum())
     
-    return {'results_df':res_df.fillna(0), 'total_icf_yield':proj_df['icf_prob'].sum(), 'total_enroll_yield':proj_df['enroll_prob'].sum()}
-
-def calculate_combined_forecast(processed_df, ordered_stages, ts_col_map, inter_stage_lags, proj_inputs, funnel_conv_rates):
-    """Orchestrates the calculation of future projections."""
-    new_leads_df = calculate_projections_from_new_leads(
-        processed_df, ordered_stages, ts_col_map, proj_inputs)
-    
-    pipeline_results = calculate_pipeline_projection(
-        processed_df, ordered_stages, ts_col_map, inter_stage_lags, funnel_conv_rates)
-    pipeline_df = pipeline_results['results_df']
-
-    combined_df = pd.concat([new_leads_df, pipeline_df], axis=1).fillna(0)
-    
-    combined_df['Total Projected ICFs'] = combined_df.get('ICFs from New Leads', 0) + combined_df.get('ICFs from Pipeline', 0)
-
-    return {
-        'combined_df': combined_df,
-        'total_new_lead_icfs': new_leads_df['ICFs from New Leads'].sum(),
-        'total_pipeline_icf_yield': pipeline_results['total_icf_yield'],
-        'total_pipeline_enroll_yield': pipeline_results['total_enroll_yield']
-    }
+    return {'results_df': res_df.fillna(0), 'total_icf_yield': proj_df['icf_prob'].sum(), 'total_enroll_yield': proj_df['enroll_prob'].sum()}
 
 # --- 4. Streamlit UI and Application Logic ---
 if 'data_processed' not in st.session_state: st.session_state.data_processed = False
@@ -420,8 +343,7 @@ if uploaded_referral_file and uploaded_funnel_def_file and not st.session_state.
                 st.session_state.data_processed = True
                 st.success("Data loaded and processed successfully!")
                 st.rerun()
-        except Exception as e:
-            st.error(f"Error loading referral data: {e}")
+        except Exception as e: st.error(f"Error loading referral data: {e}")
 
 if not st.session_state.get('data_processed', False):
     st.warning("Please upload both data files in the sidebar to begin.")
@@ -471,31 +393,28 @@ else:
     st.markdown("---")
 
     if st.button("🚀 Run Combined Forecast", key="run_forecast"):
-        effective_rates, rates_method_desc = determine_effective_projection_rates(
-            st.session_state.processed_df, st.session_state.ordered_stages, st.session_state.ts_col_map,
-            rate_method, rolling_window, manual_rates, st.session_state.inter_stage_lags)
+        effective_rates, rates_method_desc = determine_effective_projection_rates(st.session_state.processed_df, st.session_state.ordered_stages, st.session_state.ts_col_map,rate_method, rolling_window, manual_rates, st.session_state.inter_stage_lags)
         st.session_state.rates_desc = rates_method_desc
         
-        historical_df = calculate_historical_performance(
-            st.session_state.processed_df, st.session_state.ts_col_map,
-            history_months, _proj_start_month)
+        historical_df = calculate_historical_performance(st.session_state.processed_df, st.session_state.ts_col_map, history_months, _proj_start_month)
         
-        proj_inputs = {
-            'horizon': proj_horizon, 'spend_dict': proj_spend_dict, 'cpqr_dict': proj_cpqr_dict,
-            'final_conv_rates': effective_rates, 'inter_stage_lags': st.session_state.inter_stage_lags
-        }
-        future_results = calculate_combined_forecast(
-            st.session_state.processed_df, st.session_state.ordered_stages, st.session_state.ts_col_map,
-            st.session_state.inter_stage_lags, proj_inputs, effective_rates)
-        future_df = future_results['combined_df'].reindex(future_months_ui).fillna(0)
-        st.session_state.future_results_cache = future_results
-
+        proj_inputs = {'horizon': proj_horizon, 'spend_dict': proj_spend_dict, 'cpqr_dict': proj_cpqr_dict, 'final_conv_rates': effective_rates, 'inter_stage_lags': st.session_state.inter_stage_lags}
+        
+        # --- Run the two independent projections ---
+        new_leads_df = calculate_new_lead_projections(st.session_state.processed_df, st.session_state.ordered_stages, st.session_state.ts_col_map, proj_inputs)
+        pipeline_results = calculate_pipeline_projection(st.session_state.processed_df, st.session_state.ordered_stages, st.session_state.ts_col_map, st.session_state.inter_stage_lags, effective_rates)
+        pipeline_df = pipeline_results['results_df']
+        
+        # --- Combine the two future projections ---
+        future_df = pd.concat([new_leads_df, pipeline_df], axis=1).fillna(0)
+        future_df['Total Projected ICFs'] = future_df['ICFs from New Leads'] + future_df['ICFs from Pipeline']
+        
+        # --- Combine historical and the unified future projection ---
         full_timeline_df = pd.concat([historical_df, future_df]).fillna(0)
         
         all_cols = ['ICFs from New Leads', 'ICFs from Pipeline', 'Total Projected ICFs', 'Enrollments from Pipeline']
         for col in all_cols:
-            if col not in full_timeline_df.columns:
-                full_timeline_df[col] = 0
+            if col not in full_timeline_df.columns: full_timeline_df[col] = 0
         
         float_cols = full_timeline_df.select_dtypes(include=['float']).columns
         full_timeline_df[float_cols] = full_timeline_df[float_cols].round(0)
@@ -505,23 +424,27 @@ else:
         full_timeline_df['Cumulative Enrollments'] = full_timeline_df['Enrollments from Pipeline'].cumsum()
         
         st.session_state.full_forecast_data = full_timeline_df
+        st.session_state.summary_metrics = {
+            'total_new_lead_icfs': new_leads_df['ICFs from New Leads'].sum(),
+            'total_pipeline_icf_yield': pipeline_results['total_icf_yield']
+        }
 
     if 'full_forecast_data' in st.session_state:
         results_df = st.session_state.full_forecast_data
+        summary = st.session_state.summary_metrics
         
         st.header("4. Forecast Results")
         st.caption(f"Using: **{st.session_state.rates_desc}** Conversion Rates")
 
-        future_cache = st.session_state.future_results_cache
         col1, col2, col3 = st.columns(3)
         future_icf_sum = results_df.loc[_proj_start_month:]['Total Projected ICFs'].sum()
         col1.metric("Total Projected ICFs (Future Only)", f"{future_icf_sum:,.0f}")
-        col2.metric("from New Leads (Future)", f"{future_cache['total_new_lead_icfs']:,.0f}")
-        col3.metric("from Existing Pipeline (Total Yield)", f"{future_cache['total_pipeline_icf_yield']:,.1f}")
+        col2.metric("from New Leads (Future)", f"{summary['total_new_lead_icfs']:,.0f}")
+        col3.metric("from Existing Pipeline (Total Yield)", f"{summary['total_pipeline_icf_yield']:,.1f}")
 
         st.subheader("Historical & Projected Monthly View")
         display_df = results_df.copy()
-        display_df.index = display_df.index.strftime('%Y-%m')
+        if isinstance(display_df.index, pd.PeriodIndex): display_df.index = display_df.index.strftime('%Y-%m')
         display_df.index.name = "Month"
         st.dataframe(display_df[['ICFs from New Leads','ICFs from Pipeline','Total Projected ICFs','Enrollments from Pipeline']].style.format("{:,.0f}"))
 
