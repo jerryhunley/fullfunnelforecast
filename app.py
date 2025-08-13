@@ -2,32 +2,32 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from math import ceil
-import os
 import io
 import re
 from datetime import datetime
 
-# --- HELPER FUNCTIONS (FROM ORIGINAL APP) ---
+# --- CORE LOGIC FROM THE ORIGINAL APP (COPIED VERBATIM) ---
 
 @st.cache_data
 def parse_funnel_definition(uploaded_file):
-    if not uploaded_file: return None, None
+    if not uploaded_file: return None, None, None
     bytes_data = uploaded_file.getvalue()
     stringio = io.StringIO(bytes_data.decode("utf-8", errors='replace'))
     try:
         df_funnel_def = pd.read_csv(stringio, sep=None, engine='python', header=None)
-    except pd.errors.EmptyDataError: return None, None
-    parsed_funnel, parsed_stages = {}, []
+    except pd.errors.EmptyDataError: return None, None, None
+    parsed_def, ordered_stages, ts_col_map = {}, [], {}
     for col_idx in df_funnel_def.columns:
         stage_name = str(df_funnel_def[col_idx].iloc[0]).strip()
         if pd.isna(stage_name) or not stage_name: continue
-        parsed_stages.append(stage_name)
+        ordered_stages.append(stage_name)
         statuses = df_funnel_def[col_idx].iloc[1:].dropna().astype(str).str.strip().tolist()
         if stage_name not in statuses: statuses.append(stage_name)
-        parsed_funnel[stage_name] = statuses
-    return parsed_funnel, parsed_stages
+        parsed_def[stage_name] = statuses
+        ts_col_map[stage_name] = f"TS_{stage_name.replace(' ', '_')}"
+    return parsed_def, ordered_stages, ts_col_map
 
-def parse_history(history_str):
+def parse_history_string(history_str):
     if pd.isna(history_str): return []
     pattern = re.compile(r"([\w\s().'/:-]+?):\s*(\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}(?:\s*[apAP][mM])?)")
     events = []
@@ -40,38 +40,49 @@ def parse_history(history_str):
     events.sort(key=lambda x: x[1])
     return events
 
-# --- MASTER DATA PROCESSING ---
+def get_stage_timestamps(row, funnel_def, ordered_stages, ts_col_map):
+    timestamps = {ts_col: pd.NaT for ts_col in ts_col_map.values()}
+    status_to_stage_map = {s: stage for stage, statuses in funnel_def.items() for s in statuses}
+    
+    events = row.get('Parsed_Lead_Stage_History', [])
+    for event_name, event_dt in events:
+        stage = status_to_stage_map.get(event_name)
+        if stage and stage in ordered_stages:
+            ts_col = ts_col_map.get(stage)
+            if ts_col and pd.isna(timestamps[ts_col]):
+                timestamps[ts_col] = event_dt
+    return pd.Series(timestamps)
 
 @st.cache_data
-def load_and_process_data(referral_file, funnel_def_file, irt_file):
-    # --- Pipeline A: 1nHealth Funnel for RATES and IN-FLIGHT analysis ---
-    funnel_def, ordered_stages = parse_funnel_definition(funnel_def_file)
+def preprocess_1nhealth_data(referral_file, funnel_def_file):
+    """Uses the original app's logic to fully process the 1nHealth referral data."""
+    funnel_def, ordered_stages, ts_col_map = parse_funnel_definition(funnel_def_file)
     if not funnel_def: raise ValueError("Could not parse Funnel Definition file.")
-    df_1nhealth_referrals = pd.read_csv(referral_file)
-    if 'Lead Stage History' not in df_1nhealth_referrals.columns:
+    
+    df = pd.read_csv(referral_file)
+    if 'Lead Stage History' not in df.columns:
         raise ValueError("1nHealth Referral Data must have 'Lead Stage History' column.")
     
-    status_to_stage_map = {s: stage for stage, statuses in funnel_def.items() for s in statuses}
-    for stage in ordered_stages: df_1nhealth_referrals[f'TS_{stage}'] = pd.NaT
+    df['Parsed_Lead_Stage_History'] = df['Lead Stage History'].apply(parse_history_string)
+    timestamp_df = df.apply(lambda row: get_stage_timestamps(row, funnel_def, ordered_stages, ts_col_map), axis=1)
+    df = pd.concat([df, timestamp_df], axis=1)
     
-    parsed_history = df_1nhealth_referrals['Lead Stage History'].apply(parse_history)
-    for idx, events in parsed_history.items():
-        if isinstance(events, list):
-            for name, dt in events:
-                stage = status_to_stage_map.get(name)
-                if stage in ordered_stages and pd.isna(df_1nhealth_referrals.loc[idx, f'TS_{stage}']):
-                    df_1nhealth_referrals.loc[idx, f'TS_{stage}'] = dt
-
-    rates_1nhealth, lags_1nhealth = {}, {}
+    rates, lags = {}, {}
     for i in range(len(ordered_stages) - 1):
         from_stage, to_stage = ordered_stages[i], ordered_stages[i+1]
-        ts_from, ts_to = f'TS_{from_stage}', f'TS_{to_stage}'
-        denominator = df_1nhealth_referrals[ts_from].notna().sum()
-        numerator = df_1nhealth_referrals[df_1nhealth_referrals[ts_from].notna()][ts_to].notna().sum()
-        rates_1nhealth[f'{from_stage} -> {to_stage}'] = numerator / denominator if denominator > 0 else 0
-        lags_1nhealth[f'{from_stage} -> {to_stage}'] = (df_1nhealth_referrals[ts_to] - df_1nhealth_referrals[ts_from]).dt.days.mean()
+        ts_from, ts_to = ts_col_map[from_stage], ts_col_map[to_stage]
+        denominator = df[ts_from].notna().sum()
+        numerator = df[df[ts_from].notna()][ts_to].notna().sum()
+        rates[f"{from_stage} -> {to_stage}"] = numerator / denominator if denominator > 0 else 0
+        lags[f"{from_stage} -> {to_stage}"] = (df[ts_to] - df[ts_from]).dt.days.mean()
+    
+    return df, rates, lags, ordered_stages, ts_col_map
 
-    # --- Pipeline B: IRT Report for HISTORICALS and SITE rates ---
+# --- NEW APPLICATION LOGIC ---
+
+@st.cache_data
+def get_historical_summary_and_site_rates(irt_file):
+    """Gets all historical counts and site-only rates from the IRT file."""
     df_irt = pd.read_csv(irt_file)
     df_irt.columns = df_irt.columns.str.strip()
     df_irt['ICF_Date'] = pd.to_datetime(df_irt['Informed Consent Date (Local)'], errors='coerce')
@@ -90,80 +101,71 @@ def load_and_process_data(referral_file, funnel_def_file, irt_file):
     historical_summary.sort_index(inplace=True)
 
     df_site_only = df_irt[df_irt['Referral Source'] == 'Site']
-    
-    rates = {
-        '1nHealth': {'rates': rates_1nhealth, 'lags': lags_1nhealth, 'stages': ordered_stages},
-        'Site': {
-            'rate': len(df_site_only[df_site_only['Rand_Date'].notna()]) / len(df_site_only) if not df_site_only.empty else 0,
-            'lag': (df_site_only['Rand_Date'] - df_site_only['ICF_Date']).dt.days.mean(),
-            'avg_icf': df_site_only.groupby('ICF_Month').size().mean() if not df_site_only.empty else 0
-        }
+    site_rates = {
+        'rate': len(df_site_only[df_site_only['Rand_Date'].notna()]) / len(df_site_only) if not df_site_only.empty else 0,
+        'lag': (df_site_only['Rand_Date'] - df_site_only['ICF_Date']).dt.days.mean(),
+        'avg_icf': df_site_only.groupby('ICF_Month').size().mean() if not df_site_only.empty else 0
     }
-    return historical_summary, rates, df_1nhealth_referrals
+    return historical_summary, site_rates
 
-# --- FORECASTING ENGINES ---
-
-def calculate_pipeline_yield(df_1nhealth, rates, forecast_horizon):
-    """Calculates yield from leads ALREADY in the 1nHealth funnel."""
-    stages = rates['1nHealth']['stages']
-    icf_stage = next((s for s in stages if 'icf' in s.lower()), None)
-    enroll_stage = next((s for s in stages if 'enroll' in s.lower() or 'rand' in s.lower()), None)
+def calculate_pipeline_yield(df_1nhealth, rates, lags, ordered_stages, ts_col_map, horizon):
+    """The 'Funnel Analysis' component: projects yield from in-flight leads."""
+    icf_stage = next((s for s in ordered_stages if 'icf' in s.lower()), None)
+    enroll_stage = next((s for s in ordered_stages if 'enroll' in s.lower() or 'rand' in s.lower()), None)
     if not icf_stage: return pd.DataFrame()
 
-    in_flight = df_1nhealth[df_1nhealth[f'TS_{icf_stage}'].isna()].copy()
+    in_flight = df_1nhealth[df_1nhealth[ts_col_map[icf_stage]].isna()].copy()
     
-    def get_curr_stage(row):
-        for stage in reversed(stages):
-            if pd.notna(row[f'TS_{stage}']): return stage, row[f'TS_{stage}']
+    def get_current_stage(row):
+        for stage in reversed(ordered_stages):
+            if pd.notna(row[ts_col_map[stage]]): return stage, row[ts_col_map[stage]]
         return None, None
-    in_flight[['curr_stage', 'curr_stage_ts']] = in_flight.apply(get_curr_stage, axis=1, result_type='expand')
+    in_flight[['curr_stage', 'ts']] = in_flight.apply(get_current_stage, axis=1, result_type='expand')
     in_flight.dropna(subset=['curr_stage'], inplace=True)
 
-    future_months = pd.period_range(start=datetime.now(), periods=forecast_horizon, freq='M')
+    future_months = pd.period_range(start=datetime.now(), periods=horizon, freq='M')
     forecast = pd.DataFrame(0.0, index=future_months, columns=['1nHealth ICF Total', '1nHealth Rand Total'])
 
     for _, row in in_flight.iterrows():
         prob, lag = 1.0, 0.0
-        start_idx = stages.index(row['curr_stage'])
-        
-        for i in range(start_idx, len(stages) - 1):
-            from_s, to_s = stages[i], stages[i+1]
-            prob *= rates['1nHealth']['rates'].get(f"{from_s} -> {to_s}", 0)
-            lag += rates['1nHealth']['lags'].get(f"{from_s} -> {to_s}", 0)
+        start_idx = ordered_stages.index(row['curr_stage'])
+        for i in range(start_idx, len(ordered_stages) - 1):
+            from_s, to_s = ordered_stages[i], ordered_stages[i+1]
+            prob *= rates.get(f"{from_s} -> {to_s}", 0)
+            lag += lags.get(f"{from_s} -> {to_s}", 0)
             
-            if to_s == icf_stage and pd.notna(row['curr_stage_ts']) and pd.notna(lag):
-                date = row['curr_stage_ts'] + pd.to_timedelta(lag, 'D')
+            if to_s == icf_stage and pd.notna(row['ts']) and pd.notna(lag):
+                date = row['ts'] + pd.to_timedelta(lag, 'D')
                 if pd.Period(date, 'M') in forecast.index: forecast.loc[pd.Period(date, 'M'), '1nHealth ICF Total'] += prob
-            
-            if to_s == enroll_stage and pd.notna(row['curr_stage_ts']) and pd.notna(lag):
-                date = row['curr_stage_ts'] + pd.to_timedelta(lag, 'D')
+            if to_s == enroll_stage and pd.notna(row['ts']) and pd.notna(lag):
+                date = row['ts'] + pd.to_timedelta(lag, 'D')
                 if pd.Period(date, 'M') in forecast.index: forecast.loc[pd.Period(date, 'M'), '1nHealth Rand Total'] += prob
     return forecast
 
-def forecast_new_leads(rates, forecast_horizon, leads_per_month):
-    stages, s_rates = rates['1nHealth']['stages'], rates['1nHealth']['rates']
-    counts = {s: 0 for s in stages}
-    if stages: counts[stages[0]] = leads_per_month
+def forecast_new_leads(rates, lags, ordered_stages, horizon, leads_per_month):
+    """The 'Projections' component: projects yield from new leads."""
+    counts = {s: 0 for s in ordered_stages}
+    if ordered_stages: counts[ordered_stages[0]] = leads_per_month
+    for i in range(len(ordered_stages) - 1):
+        rate = rates.get(f"{ordered_stages[i]} -> {ordered_stages[i+1]}", 0)
+        counts[ordered_stages[i+1]] = counts[ordered_stages[i]] * rate
     
-    for i in range(len(stages) - 1):
-        rate = s_rates.get(f"{stages[i]} -> {stages[i+1]}", 0)
-        counts[stages[i+1]] = counts[stages[i]] * rate
+    icf_name = next(s for s in ordered_stages if 'icf' in s.lower())
+    enroll_name = next((s for s in ordered_stages if 'enroll' in s.lower() or 'rand' in s.lower()), None)
     
-    icf_name = next(s for s in stages if 'icf' in s.lower())
-    enroll_name = next((s for s in stages if 'enroll' in s.lower() or 'rand' in s.lower()), None)
-    
-    future_months = pd.period_range(start=datetime.now(), periods=forecast_horizon, freq='M')
+    future_months = pd.period_range(start=datetime.now(), periods=horizon, freq='M')
     forecast = pd.DataFrame(0, index=future_months, columns=['1nHealth ICF Total', '1nHealth Rand Total'])
     forecast['1nHealth ICF Total'] = counts.get(icf_name, 0)
     forecast['1nHealth Rand Total'] = counts.get(enroll_name, 0) if enroll_name else 0
     return forecast
 
-def forecast_site_sourced(rates, edited_assumptions):
+def forecast_site_sourced(site_rates, edited_assumptions):
+    """The simple forecast for site-sourced leads."""
     forecast = pd.DataFrame(index=edited_assumptions.index)
     forecast['Site ICF Total'] = edited_assumptions['Site ICF Total']
     forecast['Site Rand Total'] = 0.0
-    projected_rands = forecast['Site ICF Total'] * rates['Site']['rate']
-    lag = rates['Site']['lag'] if pd.notna(rates['Site']['lag']) else 0
+    projected_rands = forecast['Site ICF Total'] * site_rates['rate']
+    lag = site_rates['lag'] if pd.notna(site_rates['lag']) else 0
     lag_m, lag_f = int(lag // 30.44), (lag % 30.44) / 30.44
     for month, rands in projected_rands.items():
         if rands > 0:
@@ -184,15 +186,16 @@ with st.sidebar:
 
 if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
     try:
-        hist_summary, rates, df_1nhealth_proc = load_and_process_data(
-            uploaded_referral_file, uploaded_funnel_def_file, uploaded_irt_file
+        df_1nhealth, rates_1nhealth, lags_1nhealth, ordered_stages, ts_col_map = preprocess_1nhealth_data(
+            uploaded_referral_file, uploaded_funnel_def_file
         )
+        hist_summary, site_rates = get_historical_summary_and_site_rates(uploaded_irt_file)
         
         with st.sidebar:
             st.markdown("---")
-            st.subheader("Historical Performance")
-            st.metric("Site ICF-to-Rand Rate", f"{rates['Site']['rate']:.1%}")
-            st.metric("Site Avg. Lag (Days)", f"{rates['Site']['lag']:.1f}")
+            st.subheader("Historical Site Performance")
+            st.metric("Site ICF-to-Rand Rate", f"{site_rates['rate']:.1%}")
+            st.metric("Site Avg. Lag (Days)", f"{site_rates['lag']:.1f}")
 
         st.header("Enrollment Forecast")
         st.markdown("##### Forecast Assumptions")
@@ -200,7 +203,7 @@ if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**1nHealth Funnel**")
-            top_stage = rates['1nHealth']['stages'][0]
+            top_stage = ordered_stages[0]
             new_leads = st.number_input(f"New '{top_stage}' per Month", 0, None, 100, 10)
             horizon = st.slider("Forecast Horizon (Months)", 3, 24, 6, key='horizon')
         
@@ -209,14 +212,14 @@ if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
             st.caption("Edit default monthly ICFs below.")
             last_hist = hist_summary.index.max() if not hist_summary.empty else pd.Period(datetime.now(), 'M')
             future_m = pd.period_range(start=last_hist + 1, periods=horizon, freq='M')
-            editable_df = pd.DataFrame({'Site ICF Total': round(rates['Site']['avg_icf'])}, index=future_m)
+            editable_df = pd.DataFrame({'Site ICF Total': round(site_rates['avg_icf'])}, index=future_m)
             edited_site = st.data_editor(editable_df.rename(index=lambda p: p.strftime('%Y-%m')))
             edited_site.index = pd.PeriodIndex(edited_site.index, freq='M')
 
         # --- GENERATE & BLEND FORECASTS ---
-        yield_forecast = calculate_pipeline_yield(df_1nhealth_proc, rates, horizon)
-        new_lead_forecast = forecast_new_leads(rates, horizon, new_leads)
-        site_forecast = forecast_site_sourced(rates, edited_site)
+        yield_forecast = calculate_pipeline_yield(df_1nhealth, rates_1nhealth, lags_1nhealth, ordered_stages, ts_col_map, horizon)
+        new_lead_forecast = forecast_new_leads(rates_1nhealth, lags_1nhealth, ordered_stages, horizon, new_leads)
+        site_forecast = forecast_site_sourced(site_rates, edited_site)
         
         total_1nhealth_forecast = yield_forecast.add(new_lead_forecast, fill_value=0)
         final_forecast = total_1nhealth_forecast.join(site_forecast, how='outer').fillna(0).apply(np.ceil).astype(int)
@@ -244,7 +247,8 @@ if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
     except ValueError as e:
         st.error(f"Data Processing Error: {e}")
     except Exception as e:
-        st.error("A critical error occurred.")
+        st.error(f"A critical error occurred: {e}")
         st.exception(e)
+
 else:
     st.info("👋 Welcome! Please upload all three required files to begin.")
