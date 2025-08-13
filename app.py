@@ -13,7 +13,7 @@ from datetime import datetime
 def load_and_process_data(referral_file, funnel_def_file, irt_file):
     """
     The master function to process all three data files, create a blended historical summary,
-    and calculate the distinct performance rates and lags for each funnel.
+    and calculates the distinct performance rates and lags for each funnel.
     """
     
     # --- Pipeline A: Process 1nHealth Data using Full Funnel Logic ---
@@ -21,6 +21,7 @@ def load_and_process_data(referral_file, funnel_def_file, irt_file):
     # Helper to parse the funnel definition file
     def parse_funnel_definition(uploaded_file):
         if uploaded_file is None: return None, None
+        # Use getvalue() to read the file content from the uploaded object
         bytes_data = uploaded_file.getvalue()
         stringio = io.StringIO(bytes_data.decode("utf-8", errors='replace'))
         df_funnel_def = pd.read_csv(stringio, sep=None, engine='python', header=None)
@@ -55,19 +56,18 @@ def load_and_process_data(referral_file, funnel_def_file, irt_file):
     df_1nhealth_raw = pd.read_csv(referral_file)
     df_1nhealth = df_1nhealth_raw.copy()
     
-    # Create timestamp columns from history (simplified for this script)
     status_to_stage_map = {status: stage for stage, statuses in funnel_def.items() for status in statuses}
     for stage in ordered_stages: df_1nhealth[f'TS_{stage}'] = pd.NaT
 
     if 'Lead Stage History' in df_1nhealth.columns:
         parsed_history = df_1nhealth['Lead Stage History'].apply(parse_history)
         for idx, events in parsed_history.items():
+            if not isinstance(events, list): continue
             for event_name, event_dt in events:
                 stage = status_to_stage_map.get(event_name)
-                if stage and pd.isna(df_1nhealth.loc[idx, f'TS_{stage}']):
+                if stage and stage in ordered_stages and pd.isna(df_1nhealth.loc[idx, f'TS_{stage}']):
                     df_1nhealth.loc[idx, f'TS_{stage}'] = event_dt
     
-    # Calculate 1nHealth rates and lags
     rates_1nhealth = {}
     lags_1nhealth = {}
     for i in range(len(ordered_stages) - 1):
@@ -75,12 +75,14 @@ def load_and_process_data(referral_file, funnel_def_file, irt_file):
         ts_from, ts_to = f'TS_{from_stage}', f'TS_{to_stage}'
         if ts_from in df_1nhealth and ts_to in df_1nhealth:
             denominator = df_1nhealth[ts_from].notna().sum()
-            numerator = df_1nhealth[ts_to].notna().sum()
+            # For rate calculation, numerator should be those that reached the NEXT stage
+            numerator = df_1nhealth[df_1nhealth[ts_from].notna()][ts_to].notna().sum()
             rates_1nhealth[f'{from_stage} -> {to_stage}'] = numerator / denominator if denominator > 0 else 0
             lags_1nhealth[f'{from_stage} -> {to_stage}'] = (df_1nhealth[ts_to] - df_1nhealth[ts_from]).dt.days.mean()
 
-    avg_monthly_icf_1nhealth = df_1nhealth.groupby(df_1nhealth[f'TS_Signed ICF'].dt.to_period('M')).size().mean() if 'TS_Signed ICF' in df_1nhealth else 0
-
+    icf_stage_name = 'Signed ICF' # Assuming this is the name in your funnel definition
+    ts_icf_col = f'TS_{icf_stage_name}'
+    avg_monthly_icf_1nhealth = df_1nhealth.groupby(df_1nhealth[ts_icf_col].dt.to_period('M')).size().mean() if ts_icf_col in df_1nhealth and df_1nhealth[ts_icf_col].notna().any() else 0
 
     # --- Pipeline B: Process Site-Sourced Data ---
     df_irt_raw = pd.read_csv(irt_file)
@@ -99,11 +101,14 @@ def load_and_process_data(referral_file, funnel_def_file, irt_file):
         '1nHealth': {'rates': rates_1nhealth, 'lags': lags_1nhealth, 'avg_icf': avg_monthly_icf_1nhealth, 'stages': ordered_stages},
         'Site': {'rate': rate_site_icf_rand, 'lag': lag_site_icf_rand, 'avg_icf': avg_monthly_icf_site}
     }
+    
+    enroll_stage_name = next((s for s in ordered_stages if 'enroll' in s.lower()), None)
+    ts_enroll_col = f'TS_{enroll_stage_name}' if enroll_stage_name else None
 
     # --- Create Blended Historical Summary ---
     hist_summary = pd.concat([
-        df_1nhealth.groupby(df_1nhealth[f'TS_Signed ICF'].dt.to_period('M')).size().rename('1nHealth ICF Total'),
-        df_1nhealth.groupby(df_1nhealth[f'TS_Enrolled'].dt.to_period('M')).size().rename('1nHealth Rand Total') if 'TS_Enrolled' in df_1nhealth else pd.Series(name='1nHealth Rand Total'),
+        df_1nhealth.groupby(df_1nhealth[ts_icf_col].dt.to_period('M')).size().rename('1nHealth ICF Total'),
+        df_1nhealth.groupby(df_1nhealth[ts_enroll_col].dt.to_period('M')).size().rename('1nHealth Rand Total') if ts_enroll_col and ts_enroll_col in df_1nhealth else pd.Series(name='1nHealth Rand Total', dtype='int64'),
         df_site.groupby('ICF_Month').size().rename('Site ICF Total'),
         df_site.groupby('Rand_Month').size().rename('Site Rand Total')
     ], axis=1).fillna(0).astype(int)
@@ -113,13 +118,12 @@ def load_and_process_data(referral_file, funnel_def_file, irt_file):
 
 # --- Forecasting Engines ---
 def generate_1nhealth_forecast(rates, forecast_horizon, new_leads_per_month):
-    """Advanced forecast for 1nHealth based on multi-stage funnel."""
     stages = rates['1nHealth']['stages']
     stage_rates = rates['1nHealth']['rates']
     
-    # Simulate a cohort progressing through the funnel
     monthly_counts = {stage: 0 for stage in stages}
-    monthly_counts[stages[0]] = new_leads_per_month
+    if stages:
+        monthly_counts[stages[0]] = new_leads_per_month
     
     for i in range(len(stages) - 1):
         from_stage, to_stage = stages[i], stages[i+1]
@@ -127,9 +131,9 @@ def generate_1nhealth_forecast(rates, forecast_horizon, new_leads_per_month):
         monthly_counts[to_stage] = monthly_counts[from_stage] * rate
 
     icf_per_cohort = monthly_counts.get('Signed ICF', 0)
-    rand_per_cohort = monthly_counts.get('Enrolled', 0) # Assuming 'Enrolled' is the Rand stage
+    enroll_stage_name = next((s for s in stages if 'enroll' in s.lower()), None)
+    rand_per_cohort = monthly_counts.get(enroll_stage_name, 0) if enroll_stage_name else 0
 
-    # Create forecast table
     future_months = pd.period_range(start=datetime.now(), periods=forecast_horizon, freq='M')
     forecast_df = pd.DataFrame(index=future_months, columns=['1nHealth ICF Total', '1nHealth Rand Total']).fillna(0)
     forecast_df['1nHealth ICF Total'] = icf_per_cohort
@@ -138,7 +142,6 @@ def generate_1nhealth_forecast(rates, forecast_horizon, new_leads_per_month):
     return forecast_df.apply(np.ceil).astype(int)
 
 def generate_site_forecast(rates, edited_icf_forecast):
-    """Simple forecast for Site-Sourced enrollments."""
     forecast_df = pd.DataFrame(index=edited_icf_forecast.index)
     forecast_df['Site ICF Total'] = edited_icf_forecast['Site ICF Total']
     forecast_df['Site Rand Total'] = 0.0
@@ -168,7 +171,6 @@ with st.sidebar:
     uploaded_funnel_def_file = st.file_uploader("2. Funnel Definition (Stage Map)", type=["csv", "tsv"])
     uploaded_irt_file = st.file_uploader("3. Full IRT Report", type="csv")
 
-# --- Main Application Logic ---
 if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
     hist_summary, rates = load_and_process_data(uploaded_referral_file, uploaded_funnel_def_file, uploaded_irt_file)
     
@@ -178,15 +180,13 @@ if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
         st.metric("Site ICF-to-Rand Rate", f"{rates['Site']['rate']:.1%}")
         st.metric("Site Avg. Lag (Days)", f"{rates['Site']['lag']:.1f}")
 
-    # --- Forecast Assumption Controls ---
     st.header("Enrollment Forecast")
     st.markdown("##### Forecast Assumptions")
     
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**1nHealth Funnel**")
-        # A more realistic input for the advanced model
-        new_leads_per_month = st.number_input("New Qualified Leads per Month (e.g., 'Passed Online Form')", min_value=0, value=100, step=10)
+        new_leads_per_month = st.number_input("New Top-of-Funnel Leads per Month", min_value=0, value=100, step=10)
         forecast_horizon = st.slider("Forecast Horizon (Months)", 3, 24, 6, key='horizon')
     
     with col2:
@@ -198,13 +198,13 @@ if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
         editable_icf_df['Site ICF Total'] = round(rates['Site']['avg_icf'])
         editable_icf_df.index = editable_icf_df.index.strftime('%Y-%m')
         edited_site_assumptions = st.data_editor(editable_icf_df)
-        edited_site_assumptions.index = pd.to_period(edited_site_assumptions.index, 'M')
+        
+        # ** THE FIX IS HERE **
+        edited_site_assumptions.index = pd.PeriodIndex(edited_site_assumptions.index, freq='M')
 
-    # --- Generate Forecasts and Final Table ---
     forecast_1nhealth = generate_1nhealth_forecast(rates, forecast_horizon, new_leads_per_month)
     forecast_site = generate_site_forecast(rates, edited_site_assumptions)
     
-    # Align indices before joining
     forecast_summary = forecast_1nhealth.join(forecast_site, how='outer').fillna(0).astype(int)
 
     master_table = pd.concat([hist_summary, forecast_summary])
@@ -216,7 +216,6 @@ if uploaded_referral_file and uploaded_funnel_def_file and uploaded_irt_file:
     st.markdown("##### Master Summary Table (Historical & Forecast)")
     st.dataframe(master_table.style.format("{:,.0f}"))
     
-    # --- Visualizations ---
     st.markdown("---")
     st.header("Visualizations")
     v_col1, v_col2 = st.columns(2)
