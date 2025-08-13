@@ -3,33 +3,36 @@ import pandas as pd
 import numpy as np
 import re
 from datetime import datetime, timedelta
-import io
 
 # ==============================
 # Page setup
 # ==============================
 st.set_page_config(page_title="Recruitment Combiner", layout="wide")
 st.title("🧮 Recruitment Combiner — Pipeline + Projections")
-st.info("This tool combines two forecasts: one for the **existing pipeline** and one for **new leads from future spend**.")
+st.caption("Recreate the original Funnel Analysis (pipeline-only) and Projections (new-lead what‑if) **in the background**, then sum their monthly outputs (ICFs + final-stage).")
 
 # ==============================
 # Helpers
 # ==============================
 def _strip_us_tz(s: str) -> str:
     tz_pattern = r"\s+(?:EST|EDT|CST|CDT|MST|MDT|PST|PDT)$"
-    return re.sub(tz_pattern, "", s.strip()) if isinstance(s, str) else ""
+    return re.sub(tz_pattern, "", s.strip())
 
 def parse_dt(s):
-    if pd.isna(s): return pd.NaT
+    if pd.isna(s):
+        return pd.NaT
     return pd.to_datetime(_strip_us_tz(str(s)), errors="coerce")
 
 def parse_history_blob(blob: str):
-    if pd.isna(blob): return []
+    """Parse lines like 'Status Name: 1/2/2025 14:05 EDT' into list[(name, datetime)]"""
+    if pd.isna(blob):
+        return []
     events = []
     pat = re.compile(r"^(.+?):\s*(.+)$")
     for raw in str(blob).split("\n"):
         m = pat.match(raw.strip())
-        if not m: continue
+        if not m:
+            continue
         name, dts = m.groups()
         dt = parse_dt(dts)
         if name and pd.notna(dt):
@@ -39,260 +42,423 @@ def parse_history_blob(blob: str):
 
 @st.cache_data
 def parse_funnel_definition(uploaded_file):
-    if uploaded_file is None: return None, None, None
+    """Auto-detect CSV/TSV. First row = ordered stage names. Rows 2+ in each column = status aliases for that stage."""
+    if uploaded_file is None:
+        return None, None, None
+    import io
     content = uploaded_file.getvalue().decode("utf-8", errors="replace")
     df = pd.read_csv(io.StringIO(content), sep=None, engine="python", header=None)
     funnel_def, ordered, ts_map = {}, [], {}
     for col in df.columns:
         col_series = df[col].dropna().astype(str).str.strip().str.replace('"', '', regex=False)
-        if col_series.empty: continue
+        if col_series.empty:
+            continue
         stage_name = col_series.iloc[0]
-        if not stage_name: continue
+        if not stage_name:
+            continue
         ordered.append(stage_name)
         statuses = [s for s in col_series.iloc[1:] if s]
-        if stage_name not in statuses: statuses.append(stage_name)
+        if stage_name not in statuses:
+            statuses.append(stage_name)
         funnel_def[stage_name] = statuses
         ts_map[stage_name] = "TS_" + re.sub(r"[^A-Za-z0-9]+", "_", stage_name).strip("_")
-    if not ordered: return None, None, None
+    if not ordered:
+        return None, None, None
     return funnel_def, ordered, ts_map
 
 @st.cache_data
 def preprocess_referrals(csv_file, funnel_def, ordered_stages, ts_map):
+    """Return df with TS_* columns and Submission_Month (Period[M])."""
+    import io
     content = csv_file.getvalue().decode("utf-8", errors="replace")
     df = pd.read_csv(io.StringIO(content))
-    subm_col = next((c for c in ["Submitted On", "Referral Date"] if c in df.columns), None)
-    if subm_col is None: raise ValueError("Could not find a submission date column.")
+    # pick submission column
+    subm_col = None
+    for cand in ["Submitted On", "Referral Date", "SubmittedOn", "submitted_on"]:
+        if cand in df.columns:
+            subm_col = cand
+            break
+    if subm_col is None:
+        raise ValueError("Could not find 'Submitted On' or 'Referral Date' column in referral CSV.")
     df["Submitted On_DT"] = pd.to_datetime(df[subm_col], errors="coerce").dt.tz_localize(None)
-    df = df.dropna(subset=["Submitted On_DT"]).copy()
+    df = df[~df["Submitted On_DT"].isna()].copy()
     df["Submission_Month"] = df["Submitted On_DT"].dt.to_period("M")
 
-    stage_hist_col = next((c for c in df.columns if "stage history" in c.lower()), None)
-    status_hist_col = next((c for c in df.columns if "status history" in c.lower()), None)
-    if not stage_hist_col and not status_hist_col: raise ValueError("Need a stage or status history column.")
+    # parse histories
+    stage_hist_col = None
+    status_hist_col = None
+    for c in df.columns:
+        cl = c.lower()
+        if "stage history" in cl and stage_hist_col is None:
+            stage_hist_col = c
+        if "status history" in cl and status_hist_col is None:
+            status_hist_col = c
+    if stage_hist_col is None and status_hist_col is None:
+        raise ValueError("Need at least one of 'Lead Stage History' or 'Lead Status History' columns.")
 
-    parsed_stage = df[stage_hist_col].apply(parse_history_blob) if stage_hist_col else pd.Series([[]]*len(df), index=df.index)
-    parsed_status = df[status_hist_col].apply(parse_history_blob) if status_hist_col else pd.Series([[]]*len(df), index=df.index)
+    parsed_stage = df[stage_hist_col].apply(parse_history_blob) if stage_hist_col in df.columns else [[]]*len(df)
+    parsed_status = df[status_hist_col].apply(parse_history_blob) if status_hist_col in df.columns else [[]]*len(df)
 
-    status_to_stage = {s: stg for stg, statuses in funnel_def.items() for s in statuses}
-    ts_frame = pd.DataFrame(index=df.index, columns=list(ts_map.values()), dtype="datetime64[ns]")
+    # status -> stage mapping
+    status_to_stage = {}
+    for stg, statuses in funnel_def.items():
+        for s in statuses:
+            status_to_stage[s] = stg
+
+    # build TS_* first-occurrence timestamps for each stage
+    ts_frame = pd.DataFrame(index=df.index, columns=[ts_map[s] for s in ordered_stages], dtype="datetime64[ns]")
     for i in df.index:
-        events = sorted(parsed_stage.get(i, []) + parsed_status.get(i, []), key=lambda x: x[1])
+        events = list(parsed_stage[i]) + list(parsed_status[i])
+        events.sort(key=lambda x: x[1])
         for name, when in events:
             stg = status_to_stage.get(name, name if name in ordered_stages else None)
             if stg in ordered_stages:
                 col = ts_map[stg]
-                if pd.isna(ts_frame.at[i, col]): ts_frame.at[i, col] = when
-    return pd.concat([df, ts_frame], axis=1)
+                if pd.isna(ts_frame.at[i, col]):
+                    ts_frame.at[i, col] = when
+    out = pd.concat([df.reset_index(drop=True), ts_frame.reset_index(drop=True)], axis=1)
+    # ensure optional cols exist
+    for c in ["Site", "UTM Source", "UTM Medium"]:
+        if c not in out.columns:
+            out[c] = np.nan
+    return out
 
 @st.cache_data
 def calc_inter_stage_lags(df, ordered_stages, ts_map):
+    """Average days between consecutive stages; fallback to 30 if insufficient data."""
     lags = {}
     for a, b in zip(ordered_stages, ordered_stages[1:]):
-        ca, cb = ts_map.get(a), ts_map.get(b)
+        ca, cb = ts_map[a], ts_map[b]
         if ca in df.columns and cb in df.columns:
-            d = (df[cb] - df[ca]).dt.total_seconds() / (24*3600)
-            valid_lags = d[d >= 0]
-            if not valid_lags.empty: lags[f"{a} -> {b}"] = float(np.nanmean(valid_lags))
+            mask = df[ca].notna() & df[cb].notna()
+            if mask.any():
+                d = (df.loc[mask, cb] - df.loc[mask, ca]).dt.total_seconds() / (24*3600)
+                lags[f"{a} -> {b}"] = float(np.nanmean(d.clip(lower=0)))
+                continue
+        lags[f"{a} -> {b}"] = 30.0
     return lags
 
 @st.cache_data
-def calculate_maturity_adjusted_rates(df, ordered_stages, ts_map, lags, manual_rates, is_rolling, window_months):
-    """The robust, transit-time-adjusted rate calculation function."""
-    maturity_days = {key: max(round(1.5 * lags.get(key, 30)), 20) for key in manual_rates.keys()}
-    
-    try:
-        hist = df.groupby("Submission_Month").size().to_frame("Total")
-        for stage in ordered_stages:
-            ts = ts_map.get(stage)
-            if ts and ts in df.columns:
-                col = f"Reached_{stage.replace(' ', '_')}"
-                hist[col] = df.dropna(subset=[ts]).groupby(df['Submission_Month']).size()
-        hist = hist.fillna(0)
+def overall_rates(df, ordered_stages, ts_map):
+    """Compute simple overall stage-to-stage conversion rates from history (no recency filter)."""
+    rates = {}
+    for a, b in zip(ordered_stages, ordered_stages[1:]):
+        ca, cb = ts_map[a], ts_map[b]
+        have_a = df[ca].notna()
+        have_b = df[cb].notna()
+        denom = have_a.sum()
+        num = (have_a & have_b).sum()
+        rates[f"{a} -> {b}"] = float(num / denom) if denom else 0.0
+    return rates
 
-        rates = {}
-        for key, manual_val in manual_rates.items():
-            try: from_s, to_s = key.split(" -> ")
-            except ValueError: continue
-            col_f, col_t = f"Reached_{from_s.replace(' ', '_')}", f"Reached_{to_s.replace(' ', '_')}"
-            
-            if col_f not in hist.columns or col_t not in hist.columns:
-                rates[key] = manual_val; continue
-
-            mature_hist = hist[hist.index.to_timestamp() + pd.Timedelta(days=maturity_days.get(key, 45)) < pd.Timestamp(datetime.now())]
-            if mature_hist.empty:
-                rates[key] = manual_val; continue
-
-            overall_rate = (mature_hist[col_t].sum() / mature_hist[col_f].sum()) if mature_hist[col_f].sum() > 0 else 0
-            
-            if not is_rolling:
-                rates[key] = overall_rate if pd.notna(overall_rate) and overall_rate > 0 else manual_val
-            else:
-                monthly_rates = (mature_hist[col_t] / mature_hist[col_f].replace(0, np.nan)).where(mature_hist[col_f] >= 5, np.nan).dropna()
-                if not monthly_rates.empty:
-                    win = min(window_months, len(monthly_rates))
-                    rolling_avg = monthly_rates.rolling(win, min_periods=1).mean().iloc[-1]
-                    rates[key] = rolling_avg if pd.notna(rolling_avg) and rolling_avg > 0 else manual_val
-                else:
-                    rates[key] = overall_rate if pd.notna(overall_rate) and overall_rate > 0 else manual_val
-        
-        desc = f"Maturity-Adjusted ({window_months}-Mo Rolling)" if is_rolling else "Maturity-Adjusted (Overall)"
-        return rates, desc, maturity_days
-    except Exception:
-        return manual_rates, "Manual (error in calculation)", {}
+@st.cache_data
+def rolling_rates(df, ordered_stages, ts_map, months: int):
+    """Compute stage-to-stage conversion using only rows whose A-stage timestamp is within the last N months."""
+    rates = {}
+    if df.empty:
+        return {f"{a} -> {b}": 0.0 for a, b in zip(ordered_stages, ordered_stages[1:])}
+    # Use max observed timestamp as 'now' anchor to align with dataset
+    anchor = pd.to_datetime(df[[c for c in df.columns if c.startswith("TS_")]].max(axis=1).max())
+    if pd.isna(anchor):
+        anchor = pd.Timestamp(datetime.now())
+    cutoff = anchor - pd.DateOffset(months=months)
+    for a, b in zip(ordered_stages, ordered_stages[1:]):
+        ca, cb = ts_map[a], ts_map[b]
+        have_a_recent = df[ca].notna() & (df[ca] >= cutoff)
+        denom = have_a_recent.sum()
+        num = (have_a_recent & df[cb].notna()).sum()
+        rates[f"{a} -> {b}"] = float(num / denom) if denom else 0.0
+    return rates
 
 def product_rate_to(target_stage, ordered_stages, rates):
-    try: idx = ordered_stages.index(target_stage)
-    except ValueError: return 0.0
-    return np.prod([float(rates.get(f"{ordered_stages[i]} -> {ordered_stages[i+1]}", 0.0)) for i in range(idx)])
+    """Product of rates from stage 0 up to target_stage (inclusive end)."""
+    try:
+        idx = ordered_stages.index(target_stage)
+    except ValueError:
+        return 0.0
+    p = 1.0
+    for i in range(idx):
+        a, b = ordered_stages[i], ordered_stages[i+1]
+        p *= float(rates.get(f"{a} -> {b}", 0.0))
+    return p
 
 def total_lag_to(target_stage, ordered_stages, lags):
-    try: idx = ordered_stages.index(target_stage)
-    except ValueError: return 0.0
-    return sum(float(lags.get(f"{ordered_stages[i]} -> {ordered_stages[i+1]}", 30.0)) for i in range(idx))
+    """Sum of lags from stage 0 up to target_stage (inclusive end)."""
+    try:
+        idx = ordered_stages.index(target_stage)
+    except ValueError:
+        return 0.0
+    s = 0.0
+    for i in range(idx):
+        a, b = ordered_stages[i], ordered_stages[i+1]
+        s += float(lags.get(f"{a} -> {b}", 30.0))
+    return s
 
 @st.cache_data
 def pipeline_projection(df, ordered_stages, ts_map, rates, lags, icf_stage, final_stage, terminal_extras):
-    default = {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0, 'in_flight_df': pd.DataFrame()}
+    """Recreate Funnel Analysis 'Projected Monthly Landings (Future)' for pipeline only (no new leads)."""
     terminal_stages = set([final_stage] + list(terminal_extras))
     term_cols = [ts_map.get(s) for s in terminal_stages if ts_map.get(s) in df.columns]
-    is_terminal = pd.Series(False, index=df.index);
-    for c in term_cols: is_terminal |= df[c].notna()
+    is_terminal = pd.Series(False, index=df.index)
+    for c in term_cols:
+        is_terminal |= df[c].notna()
     in_flight = df.loc[~is_terminal].copy()
+    # find current stage per row (latest non-null TS_* among ordered non-terminal stages)
+    non_terminal_stages = [s for s in ordered_stages if s not in terminal_stages]
+    ts_cols = [ts_map[s] for s in non_terminal_stages if ts_map.get(s) in df.columns]
+    if not ts_cols:
+        return pd.DataFrame(columns=["ICFs from Pipeline", "Final from Pipeline"])
+    in_flight["curr_t"] = in_flight[ts_cols].max(axis=1)
 
-    non_terminal = [s for s in ordered_stages if s not in terminal_stages]
-    ts_cols = [ts_map[s] for s in non_terminal if ts_map.get(s) in df.columns]
-    if not ts_cols: return default
-    in_flight['current_ts'] = in_flight[ts_cols].max(axis=1)
-    in_flight = in_flight.dropna(subset=['current_ts']).copy()
-    
-    stage_map = {ts_map[s]: s for s in non_terminal}
-    in_flight['current_stage'] = in_flight[ts_cols].idxmax(axis=1).map(stage_map)
-    
     records = []
-    try: icf_idx, final_idx = ordered_stages.index(icf_stage), ordered_stages.index(final_stage)
-    except ValueError: return default
-
     for _, row in in_flight.iterrows():
-        start_idx = ordered_stages.index(row['current_stage'])
-        p_to_icf = product_rate_to(icf_stage, ordered_stages[start_idx:], rates)
-        lag_to_icf = total_lag_to(icf_stage, ordered_stages[start_idx:], lags)
-        p_to_final = product_rate_to(final_stage, ordered_stages[start_idx:], rates)
-        lag_to_final = total_lag_to(final_stage, ordered_stages[start_idx:], lags)
-        if p_to_icf > 0:
-            icf_month = pd.Period(row['current_ts'] + timedelta(days=lag_to_icf), "M")
-            fin_month = pd.Period(row['current_ts'] + timedelta(days=lag_to_final), "M")
-            records.append((icf_month, p_to_icf, fin_month, p_to_final))
-    
-    if not records: return default
-    rec_df = pd.DataFrame(records, columns=["icf_m", "p_icf", "fin_m", "p_final"])
-    idx = pd.period_range(start=datetime.now(), periods=36, freq="M")
-    out = pd.DataFrame(0.0, index=idx, columns=["ICFs from Pipeline", f"{final_stage} from Pipeline"])
-    out["ICFs from Pipeline"] = out.index.map(rec_df.groupby("icf_m")["p_icf"].sum()).fillna(0)
-    out[f"{final_stage} from Pipeline"] = out.index.map(rec_df.groupby("fin_m")["p_final"].sum()).fillna(0)
-    return {'results_df': out, 'total_icf_yield': rec_df['p_icf'].sum(), 'total_enroll_yield': rec_df['p_final'].sum(), 'in_flight_df': in_flight}
+        last_stage = None
+        last_time = row["curr_t"]
+        for s in reversed(non_terminal_stages):
+            c = ts_map[s]
+            if c in in_flight.columns and pd.notna(row[c]):
+                last_stage = s
+                break
+        if last_stage is None or pd.isna(last_time):
+            continue
+        try:
+            start_idx = ordered_stages.index(last_stage)
+            icf_idx = ordered_stages.index(icf_stage)
+            final_idx = ordered_stages.index(final_stage)
+        except ValueError:
+            continue
 
-@st.cache_data
-def projections_new_leads(df, ordered_stages, ts_map, horizon, spend, cpqr, rates, lags, icf_stage, final_stage):
-    start = (df["Submission_Month"].max() + 1) if not df.empty else pd.Period(datetime.now(), "M")
-    future_months = pd.period_range(start=start, periods=horizon, freq="M")
-    cohorts = pd.DataFrame({"Ad_Spend": [spend.get(m,0)], "CPQR": [cpqr.get(m,120)]}, index=future_months)
-    cohorts["New_QLs"] = (cohorts["Ad_Spend"] / cohorts["CPQR"].replace(0, np.nan)).fillna(0.0)
-    cohorts["ICFs_generated"] = cohorts["New_QLs"] * product_rate_to(icf_stage, ordered, rates)
-    cohorts["Final_generated"] = cohorts["New_QLs"] * product_rate_to(final_stage, ordered, rates)
-    lag_icf, lag_final = total_lag_to(icf_stage, ordered, lags), total_lag_to(final_stage, ordered, lags)
-    
-    idx = pd.period_range(start=start, periods=horizon + int(lag_final/30) + 2, freq="M")
-    out = pd.DataFrame(0.0, index=idx, columns=["ICFs from New Leads", f"{final_stage} from New Leads"])
-    for m, row in cohorts.iterrows():
-        if row["ICFs_generated"] > 0: out.loc[(m.to_timestamp() + timedelta(days=lag_icf)).to_period("M")] += row["ICFs_generated"]
-        if row["Final_generated"] > 0: out.loc[(m.to_timestamp() + timedelta(days=lag_final)).to_period("M")] += row["Final_generated"]
+        # accumulate to ICF
+        p_to_icf = 1.0
+        lag_to_icf = 0.0
+        for i in range(start_idx, icf_idx):
+            a, b = ordered_stages[i], ordered_stages[i+1]
+            p_to_icf *= float(rates.get(f"{a} -> {b}", 0.0))
+            lag_to_icf += float(lags.get(f"{a} -> {b}", 30.0))
+
+        # from ICF to final
+        p_icf_to_final = 1.0
+        lag_icf_to_final = 0.0
+        for i in range(icf_idx, final_idx):
+            a, b = ordered_stages[i], ordered_stages[i+1]
+            p_icf_to_final *= float(rates.get(f"{a} -> {b}", 0.0))
+            lag_icf_to_final += float(lags.get(f"{a} -> {b}", 30.0))
+
+        p_to_final = p_to_icf * p_icf_to_final
+        if p_to_icf > 0:
+            icf_month = pd.Period(last_time + timedelta(days=lag_to_icf), "M")
+            fin_month = pd.Period(last_time + timedelta(days=lag_to_icf + lag_icf_to_final), "M")
+            records.append((icf_month, p_to_icf, fin_month, p_to_final))
+
+    if not records:
+        idx = pd.period_range(start=pd.Period(datetime.now(), "M"), periods=6, freq="M")
+        return pd.DataFrame(0.0, index=idx, columns=["ICFs from Pipeline", "Final from Pipeline"])
+
+    rec_df = pd.DataFrame(records, columns=["icf_m", "p_icf", "fin_m", "p_final"])
+    idx = pd.period_range(start=min(rec_df["icf_m"].min(), rec_df["fin_m"].min()),
+                          end=max(rec_df["icf_m"].max(), rec_df["fin_m"].max()) + 6, freq="M")
+    out = pd.DataFrame(0.0, index=idx, columns=["ICFs from Pipeline", "Final from Pipeline"])
+    out.loc[rec_df.groupby("icf_m").size().index, "ICFs from Pipeline"] = rec_df.groupby("icf_m")["p_icf"].sum()
+    out.loc[rec_df.groupby("fin_m").size().index, "Final from Pipeline"] = rec_df.groupby("fin_m")["p_final"].sum()
     return out
 
-def combine_and_display(pipe_res, new_df, final_stage_name):
-    idx = pipe_res['results_df'].index.union(new_df.index)
+@st.cache_data
+def projections_new_leads(processed_df, ordered_stages, ts_map, horizon_months, spend_by_month, cpqr_by_month,
+                          rates, lags, icf_stage, final_stage):
+    """Recreate Projections table + add final-stage from new leads."""
+    start_month = (processed_df["Submission_Month"].max() + 1) if "Submission_Month" in processed_df else pd.Period(datetime.now(), "M")
+    future_months = pd.period_range(start=start_month, periods=horizon_months, freq="M")
+    cohorts = pd.DataFrame(index=future_months)
+    cohorts["Ad_Spend"] = [float(spend_by_month.get(m, 0.0)) for m in future_months]
+    cohorts["CPQR"] = [float(cpqr_by_month.get(m, 120.0)) for m in future_months]
+    cohorts["New_QLs"] = (cohorts["Ad_Spend"] / cohorts["CPQR"].replace(0, np.nan)).fillna(0.0)
+
+    p_to_icf = product_rate_to(icf_stage, ordered_stages, rates)
+    lag_to_icf = total_lag_to(icf_stage, ordered_stages, lags)
+
+    # Multiply rates from ICF to final
+    try:
+        icf_idx = ordered_stages.index(icf_stage)
+        final_idx = ordered_stages.index(final_stage)
+    except ValueError:
+        icf_idx = None
+        final_idx = None
+    p_icf_to_final = 1.0
+    lag_icf_to_final = 0.0
+    if icf_idx is not None and final_idx is not None and final_idx > icf_idx:
+        for i in range(icf_idx, final_idx):
+            a, b = ordered_stages[i], ordered_stages[i+1]
+            p_icf_to_final *= float(rates.get(f"{a} -> {b}", 0.0))
+            lag_icf_to_final += float(lags.get(f"{a} -> {b}", 30.0))
+
+    cohorts["ICFs_generated"] = cohorts["New_QLs"] * p_to_icf
+    cohorts["Final_generated"] = cohorts["ICFs_generated"] * p_icf_to_final
+    cohorts["Cohort_CPICF"] = (cohorts["Ad_Spend"] / cohorts["ICFs_generated"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    # smear into landing months
+    land_icf_idx, land_icf_vals = [], []
+    land_fin_idx, land_fin_vals = [], []
+    for m, row in cohorts.iterrows():
+        icf_land_m = (m.to_timestamp() + timedelta(days=lag_to_icf)).to_period("M")
+        fin_land_m = (m.to_timestamp() + timedelta(days=lag_to_icf + lag_icf_to_final)).to_period("M")
+        land_icf_idx.append(icf_land_m); land_icf_vals.append(row["ICFs_generated"])
+        land_fin_idx.append(fin_land_m); land_fin_vals.append(row["Final_generated"])
+
+    idx = pd.period_range(start=min(land_icf_idx + land_fin_idx) if land_icf_idx else start_month, periods=horizon_months + 12, freq="M")
+    out = pd.DataFrame(0.0, index=idx, columns=["ICFs from New Leads", "Final from New Leads"])
+    if land_icf_idx:
+        icf_series = pd.Series(land_icf_vals, index=land_icf_idx).groupby(level=0).sum()
+        out.loc[icf_series.index, "ICFs from New Leads"] = icf_series.values
+    if land_fin_idx:
+        fin_series = pd.Series(land_fin_vals, index=land_fin_idx).groupby(level=0).sum()
+        out.loc[fin_series.index, "Final from New Leads"] = fin_series.values
+    return out, cohorts
+
+def combine_monthly_tables(pipeline_df, new_df):
+    idx = pipeline_df.index.union(new_df.index)
     both = pd.DataFrame(index=idx)
-    for col_suffix in ["from Pipeline", "from New Leads"]:
-        both[f"ICFs {col_suffix}"] = (pipe_res['results_df'] if 'Pipeline' in col_suffix else new_df).get(f"ICFs {col_suffix}", 0).reindex(idx).fillna(0)
-        both[f"{final_stage_name} {col_suffix}"] = (pipe_res['results_df'] if 'Pipeline' in col_suffix else new_df).get(f"{final_stage_name} {col_suffix}", 0).reindex(idx).fillna(0)
+    for col in ["ICFs from Pipeline", "Final from Pipeline"]:
+        both[col] = pipeline_df.get(col, 0.0).reindex(idx).fillna(0.0)
+    for col in ["ICFs from New Leads", "Final from New Leads"]:
+        both[col] = new_df.get(col, 0.0).reindex(idx).fillna(0.0)
     both["Total Projected ICFs"] = both["ICFs from Pipeline"] + both["ICFs from New Leads"]
-    both[f"Total Projected {final_stage_name}"] = both[f"{final_stage_name} from Pipeline"] + both[f"{final_stage_name} from New Leads"]
+    both["Total Projected Final"] = both["Final from Pipeline"] + both["Final from New Leads"]
+    both["Cumulative ICFs"] = both["Total Projected ICFs"].cumsum()
+    both["Cumulative Final"] = both["Total Projected Final"].cumsum()
     return both
 
+def best_guess_icf_stage(ordered_stages):
+    for s in ordered_stages:
+        if "icf" in s.lower() or "consent" in s.lower():
+            return s
+    return ordered_stages[-2] if len(ordered_stages) >= 2 else ordered_stages[-1]
+
+def best_guess_final_stage(ordered_stages):
+    for s in reversed(ordered_stages):
+        sl = s.lower()
+        if "enroll" in sl or "random" in sl or "randomization" in sl or "randomised" in sl or "randomized" in sl:
+            return s
+    return ordered_stages[-1]
+
 # ==============================
-# Main App
+# UI — Inputs
 # ==============================
 with st.sidebar:
-    st.header("1) Upload"); ref_csv, funnel_csv = st.file_uploader("Referral Data"), st.file_uploader("Funnel Definition")
-    st.header("2) Rates"); rate_mode = st.radio("Rates from?", ["Manual", "Maturity-Adjusted (Rolling)", "Maturity-Adjusted (Overall)"], index=1, horizontal=True)
-    roll_months = st.slider("Rolling window (months)", 1, 12, 3) if "Rolling" in rate_mode else None
-    st.header("3) Projections"); horizon = st.number_input("Projection horizon (months)", 1, 48, 12, 1)
+    st.header("1) Upload")
+    ref_csv = st.file_uploader("Referral Data (CSV)", type=["csv"], key="refcsv")
+    funnel_csv = st.file_uploader("Funnel Definition (CSV/TSV)", type=["csv", "tsv"], key="fundef")
+
+    st.header("2) Stage Mapping")
+    st.caption("Pick which stage is **ICF signed** and which is your **final outcome** (Randomization/Enrollment).")
+
+    st.header("3) Rates")
+    rate_mode = st.radio("How to compute conversion rates?", ["Manual", "Overall (all history)", "Rolling window"], index=2)
+    roll_months = st.slider("Rolling window (months)", 1, 12, 3) if rate_mode == "Rolling window" else None
+    st.caption("Manual lets you set each adjacent stage→stage %; Rolling computes using only recent rows.")
+
+    st.header("4) Projections")
+    horizon = st.number_input("Projection horizon (months)", min_value=1, max_value=48, value=12, step=1)
+    st.caption("Enter monthly Spend and CPQR; defaults repeat.")
+
+    st.header("5) Labels (display only)")
+    final_label = st.radio("Final stage label for outputs", ["Randomizations", "Enrollments"], index=0)
 
 if ref_csv and funnel_csv:
     try:
-        funnel_def, ordered, ts_map = parse_funnel_definition(funnel_csv)
-        if not funnel_def: st.error("Funnel definition invalid."); st.stop()
-        
-        df = preprocess_referrals(ref_csv, funnel_def, ordered, ts_map)
-        lags = calc_inter_stage_lags(df, ordered, ts_map)
+        funnel_def, ordered_stages, ts_map = parse_funnel_definition(funnel_csv)
+        if not funnel_def:
+            st.error("Could not parse the funnel definition file.")
+            st.stop()
 
-        st.sidebar.header("Stage Mapping")
-        icf_stage = st.sidebar.selectbox("ICF stage", ordered, index=ordered.index(best_guess_stage(ordered, ["icf", "consent"], -2)))
-        final_stage = st.sidebar.selectbox("Final stage", ordered, index=ordered.index(best_guess_stage(ordered, ["enroll", "random"], -1)))
-        
-        if ordered.index(final_stage) <= ordered.index(icf_stage): st.sidebar.error("Final stage must be after ICF stage."); st.stop()
+        # Stage pickers
+        col1, col2 = st.columns(2)
+        with col1:
+            icf_stage = st.selectbox("ICF stage", options=ordered_stages, index=ordered_stages.index(best_guess_icf_stage(ordered_stages)))
+        with col2:
+            final_stage = st.selectbox("Final outcome stage", options=ordered_stages, index=ordered_stages.index(best_guess_final_stage(ordered_stages)))
 
-        start_m = (df["Submission_Month"].max() + 1) if not df.empty else pd.Period(datetime.now(), "M")
-        future_months = pd.period_range(start=start_m, periods=horizon, freq="M")
-        
-        st.subheader("Future Spend & CPQR"); colA, colB = st.columns(2)
-        spend_df = colA.data_editor(pd.DataFrame({"Month": future_months.astype(str), "Ad Spend": [20000.0]*len(future_months)}), use_container_width=True, num_rows="fixed")
-        cpqr_df = colB.data_editor(pd.DataFrame({"Month": future_months.astype(str), "CPQR": [120.0]*len(future_months)}), use_container_width=True, num_rows="fixed")
-        spend_dict = {pd.Period(r["Month"], "M"): r["Ad Spend"] for _, r in spend_df.iterrows()}
-        cpqr_dict = {pd.Period(r["Month"], "M"): r["CPQR"] for _, r in cpqr_df.iterrows()}
+        if ordered_stages.index(final_stage) <= ordered_stages.index(icf_stage):
+            st.error("Final outcome stage must come **after** the ICF stage in your funnel order.")
+            st.stop()
 
-        if rate_mode == "Manual":
-            st.subheader("Manual Conversion Rates (%)"); eff_rates = {}
-            cols = st.columns(3)
-            for i, (a,b) in enumerate(zip(ordered, ordered[1:])):
-                eff_rates[f"{a} -> {b}"] = cols[i%3].slider(f"{a} → {b}", 0.0,100.0, 50.0, 0.1)/100
-            rates_desc, maturity_applied = "Manual Input", None
+        df = preprocess_referrals(ref_csv, funnel_def, ordered_stages, ts_map)
+        lags = calc_inter_stage_lags(df, ordered_stages, ts_map)
+
+        # Prepare spend & CPQR editors
+        start_m = (df["Submission_Month"].max() + 1) if "Submission_Month" in df else pd.Period(datetime.now(), "M")
+        future_months_ui = pd.period_range(start=start_m, periods=horizon, freq="M")
+
+        st.subheader("Spend & CPQR (for Projections)")
+        colA, colB = st.columns(2)
+        with colA:
+            spend_df = pd.DataFrame({"Month": future_months_ui.astype(str), "Ad_Spend": [0.0]*len(future_months_ui)})
+            spend_df = st.data_editor(spend_df, use_container_width=True, num_rows="fixed", key="spend_editor")
+            spend_dict = {pd.Period(r["Month"], "M"): float(r["Ad_Spend"]) for _, r in spend_df.iterrows()}
+        with colB:
+            cpqr_df = pd.DataFrame({"Month": future_months_ui.astype(str), "CPQR": [120.0]*len(future_months_ui)})
+            cpqr_df = st.data_editor(cpqr_df, use_container_width=True, num_rows="fixed", key="cpqr_editor")
+            cpqr_dict = {pd.Period(r["Month"], "M"): float(r["CPQR"]) for _, r in cpqr_df.iterrows()}
+
+        # Compute base rates according to mode, then allow manual overrides if Manual
+        if rate_mode == "Overall (all history)":
+            eff_rates = overall_rates(df, ordered_stages, ts_map)
+        elif rate_mode == "Rolling window":
+            eff_rates = rolling_rates(df, ordered_stages, ts_map, months=int(roll_months or 3))
         else:
-            manual_rate_placeholders = {f"{a} -> {b}": 0.5 for a, b in zip(ordered, ordered[1:])}
-            eff_rates, rates_desc, maturity_applied = calculate_maturity_adjusted_rates(df, ordered, ts_map, lags, manual_rate_placeholders, is_rolling="Rolling" in rate_mode, window_months=int(roll_months or 3))
+            # Manual: build sliders for each adjacent pair
+            default_rates = overall_rates(df, ordered_stages, ts_map)
+            st.subheader("Manual Conversion Rates (% from → to)")
+            eff_rates = {}
+            cols = st.columns(3)
+            for idx, (a, b) in enumerate(zip(ordered_stages, ordered_stages[1:])):
+                with cols[idx % 3]:
+                    default_pct = float(default_rates.get(f"{a} -> {b}", 0.0)) * 100.0
+                    val = st.slider(f"{a} → {b}", 0.0, 100.0, float(round(default_pct, 1)), 0.1) / 100.0
+                    eff_rates[f"{a} -> {b}"] = val
 
-        if st.button("🚀 Run Combined Calculation"):
-            terminal_extras = [s for s in ordered if s.lower() in ["screen failed", "lost"]]
-            pipe_res = pipeline_projection(df, ordered, ts_map, eff_rates, lags, icf_stage, final_stage, terminal_extras)
-            new_df = projections_new_leads(df, ordered, ts_map, horizon, spend_dict, cpqr_dict, eff_rates, lags, icf_stage, final_stage)
-            combined = combine_and_display(pipe_res, new_df, final_stage)
-            
-            st.success("Done.")
-            st.header("Results")
-            with st.expander(f"Rates Used in This Forecast ({rates_desc})"):
-                st.json({k: f"{v*100:.1f}%" for k, v in eff_rates.items()})
-                if maturity_applied: st.write("Maturity Period Applied (Days):"); st.json({k: f"{v:.0f}" for k, v in maturity_applied.items()})
-            
-            c1,c2,c3 = st.columns(3)
-            c1.metric("Total Future ICFs", f"{combined['Total Projected ICFs'].sum():.1f}")
-            c2.metric("... from New Leads", f"{combined['ICFs from New Leads'].sum():.1f}")
-            c3.metric("... from Pipeline", f"{combined['ICFs from Pipeline'].sum():.1f} (Total Yield: {pipe_res['total_icf_yield']:.1f})")
+        # Button to run
+        if st.button("Run Combined Calculation"):
+            # Terminal extras: treat Screen Failed and Lost as terminal even if not present in mapping
+            terminal_extras = [s for s in ordered_stages if s.lower() in ["screen failed", "lost"]]
 
+            pipe_df = pipeline_projection(df, ordered_stages, ts_map, eff_rates, lags, icf_stage, final_stage, terminal_extras)
+            new_df, cohorts = projections_new_leads(df, ordered_stages, ts_map, horizon, spend_dict, cpqr_dict, eff_rates, lags, icf_stage, final_stage)
+            combined = combine_monthly_tables(pipe_df, new_df)
+
+            # Display label mapping for final stage
+            renamed = combined.rename(columns={
+                "Final from Pipeline": f"{final_label} from Pipeline",
+                "Final from New Leads": f"{final_label} from New Leads",
+                "Total Projected Final": f"Total Projected {final_label}",
+                "Cumulative Final": f"Cumulative {final_label}",
+            })
+
+            st.success("Done. Final combined monthly table below.")
             st.subheader("📅 Combined Monthly Landings")
-            display_cols = ["ICFs from New Leads", "ICFs from Pipeline", "Total Projected ICFs", f"{final_stage} from New Leads", f"{final_stage} from Pipeline", f"Total Projected {final_stage}"]
-            st.dataframe(combined[display_cols].round(1).style.format("{:.1f}"), use_container_width=True)
+            display = renamed.copy()
+            display.index = display.index.astype(str)
+            st.dataframe(display[[
+                "ICFs from New Leads", "ICFs from Pipeline", "Total Projected ICFs",
+                f"{final_label} from New Leads", f"{final_label} from Pipeline", f"Total Projected {final_label}",
+                "Cumulative ICFs", f"Cumulative {final_label}"
+            ]].round(2), use_container_width=True)
 
-            st.subheader("🔬 Pipeline Breakdown")
-            narrative = generate_pipeline_narrative(pipe_res['in_flight_df'], ordered, eff_rates, lags, final_stage)
-            if not narrative: st.info("No leads are currently in-flight.")
-            else:
-                for step in narrative:
-                    with st.expander(f"From '{step['current_stage']}' ({step['count']} leads)"):
-                        st.metric(f"Leads Currently At Stage", f"{step['count']:,}")
-                        for proj in step['downstream']:
-                            st.info(f"**~{proj['count']:.1f}** → **'{proj['stage']}'** (in ~{proj['lag']:.0f} days)", icon="➡️")
-            
-            with st.expander("Downloads"):
-                st.download_button("⬇️ Combined", combined.to_csv().encode("utf-8"), "combined.csv")
+            with st.expander("Underlying tables (generated behind the scenes)"):
+                st.markdown("**Pipeline-only (Funnel Analysis → Projected Monthly Landings (Future))**")
+                tmp = pipe_df.copy(); tmp.index = tmp.index.astype(str); st.dataframe(tmp.round(2), use_container_width=True)
+                st.markdown("**New Leads (Projections → Projected Monthly ICFs & Cohort CPICF)**")
+                tmp2 = new_df.copy(); tmp2.index = tmp2.index.astype(str); st.dataframe(tmp2.round(2), use_container_width=True)
+                st.markdown("**Cohort Table (for reference)**")
+                ctmp = cohorts.copy(); ctmp.index = ctmp.index.astype(str); st.dataframe(ctmp.round(2), use_container_width=True)
 
-    except Exception as e: st.error(f"An error occurred: {e}")
-else: st.info("Upload your two files on the left to get started.")
+            # Downloads
+            st.download_button("⬇️ Download Combined CSV", renamed.to_csv().encode("utf-8"), file_name="combined_monthly_landings.csv", mime="text/csv")
+            st.download_button("⬇️ Download Pipeline CSV", pipe_df.to_csv().encode("utf-8"), file_name="pipeline_projection.csv", mime="text/csv")
+            st.download_button("⬇️ Download New-Leads CSV", new_df.to_csv().encode("utf-8"), file_name="new_leads_projection.csv", mime="text/csv")
+            st.download_button("⬇️ Download Cohorts CSV", cohorts.to_csv().encode("utf-8"), file_name="cohort_cpicf.csv", mime="text/csv")
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+else:
+    st.info("Upload your two files on the left to get started.")
+
