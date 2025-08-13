@@ -353,7 +353,6 @@ def calculate_pipeline_projection(_processed_df, ordered_stages, ts_col_map, int
 def calculate_combined_forecast(processed_df, ordered_stages, ts_col_map, inter_stage_lags, proj_inputs, funnel_conv_rates):
     """
     Orchestrates the calculation of future projections from both new and existing leads.
-    This is the new function that was missing.
     """
     # 1. Get projections from new leads (future ad spend)
     new_leads_df = calculate_projections_from_new_leads(
@@ -492,6 +491,11 @@ else:
         for col in all_cols:
             if col not in full_timeline_df.columns:
                 full_timeline_df[col] = 0
+        
+        # Round the float columns before converting to int
+        float_cols = full_timeline_df.select_dtypes(include=['float']).columns
+        full_timeline_df[float_cols] = full_timeline_df[float_cols].round(0)
+
         full_timeline_df = full_timeline_df[all_cols].astype(int)
         
         # 6. Recalculate cumulative sums on the complete, unified timeline
