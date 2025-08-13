@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -168,22 +167,31 @@ def calculate_overall_inter_stage_lags(_processed_df, ordered_stages, ts_col_map
 # --- 3. Core Forecasting and Calculation Functions ---
 
 @st.cache_data
-def calculate_historical_performance(processed_df, historical_months, ts_col_map):
-    """Calculates actual landed ICFs and Enrollments for past months."""
-    hist_df = pd.DataFrame(index=historical_months)
-    
+def calculate_historical_performance(processed_df, ts_col_map, num_months_history, end_month_period):
+    """
+    Calculates actual landed ICFs and Enrollments for past months.
+    NOTE: Changed arguments to be hashable for Streamlit's cache.
+    """
+    if processed_df is None or processed_df.empty or num_months_history <= 0:
+        return pd.DataFrame()
+
+    historical_start_month = end_month_period - num_months_history
+    historical_months_range = pd.period_range(start=historical_start_month, end=end_month_period - 1, freq='M')
+    hist_df = pd.DataFrame(index=historical_months_range)
+
+    # Calculate ICFs that landed in the historical window
     icf_ts_col = ts_col_map.get(STAGE_SIGNED_ICF)
     if icf_ts_col and icf_ts_col in processed_df.columns:
         icf_data = processed_df.dropna(subset=[icf_ts_col])
-        # Group by the landing month of the ICF, not submission month
         icf_counts = icf_data.groupby(icf_data[icf_ts_col].dt.to_period('M')).size()
-        hist_df['Historical ICFs Landed'] = hist_df.index.map(icf_counts)
+        hist_df['Total Projected ICFs'] = hist_df.index.map(icf_counts)
 
+    # Calculate Enrollments that landed in the historical window
     enroll_ts_col = ts_col_map.get(STAGE_ENROLLED)
     if enroll_ts_col and enroll_ts_col in processed_df.columns:
         enroll_data = processed_df.dropna(subset=[enroll_ts_col])
         enroll_counts = enroll_data.groupby(enroll_data[enroll_ts_col].dt.to_period('M')).size()
-        hist_df['Historical Enrollments Landed'] = hist_df.index.map(enroll_counts)
+        hist_df['Enrollments from Pipeline'] = hist_df.index.map(enroll_counts)
         
     return hist_df.fillna(0).astype(int)
 
@@ -204,7 +212,11 @@ def determine_effective_projection_rates(_processed_df, ordered_stages, ts_col_m
         hist_counts = hist_counts.fillna(0)
         
         for rate_key, manual_val in manual_rates.items():
-            from_stage, to_stage = rate_key.split(" -> ")
+            try:
+                from_stage, to_stage = rate_key.split(" -> ")
+            except ValueError:
+                continue # Skip if key is malformed
+
             col_from = f"Reached_{from_stage.replace(' ', '_')}"
             col_to = f"Reached_{to_stage.replace(' ', '_')}"
 
@@ -212,8 +224,11 @@ def determine_effective_projection_rates(_processed_df, ordered_stages, ts_col_m
                 monthly_rates = (hist_counts[col_to] / hist_counts[col_from].replace(0, np.nan)).dropna()
                 if not monthly_rates.empty:
                     win = min(rolling_window, len(monthly_rates)) if rolling_window != 999 else len(monthly_rates)
-                    avg = monthly_rates.rolling(window=win, min_periods=1).mean()
-                    if not avg.empty: calculated_rates[rate_key] = avg.iloc[-1]
+                    if win > 0:
+                        avg = monthly_rates.rolling(window=win, min_periods=1).mean()
+                        if not avg.empty and pd.notna(avg.iloc[-1]):
+                            calculated_rates[rate_key] = avg.iloc[-1]
+                        else: calculated_rates[rate_key] = manual_val
                     else: calculated_rates[rate_key] = manual_val
                 else: calculated_rates[rate_key] = manual_val
             else: calculated_rates[rate_key] = manual_val
@@ -224,18 +239,21 @@ def determine_effective_projection_rates(_processed_df, ordered_stages, ts_col_m
         return manual_rates, "Manual (Error in Rolling Calc)"
 
 @st.cache_data
-def calculate_projections(_processed_df, ordered_stages, ts_col_map, proj_inputs):
+def calculate_projections_from_new_leads(_processed_df, ordered_stages, ts_col_map, proj_inputs):
+    """Calculates ICFs generated from NEW leads via future spend."""
     if _processed_df is None: return pd.DataFrame()
     
     horizon, future_spend, assumed_cpqr, conv_rates, inter_stage_lags = (
         proj_inputs['horizon'], proj_inputs['spend_dict'], proj_inputs['cpqr_dict'],
         proj_inputs['final_conv_rates'], proj_inputs.get('inter_stage_lags', {}))
 
-    total_lag = 0
+    total_lag_to_icf = 0
     try:
         icf_idx = ordered_stages.index(STAGE_SIGNED_ICF)
-        for i in range(icf_idx): total_lag += inter_stage_lags.get(f"{ordered_stages[i]} -> {ordered_stages[i+1]}", 30)
-    except (ValueError, IndexError): total_lag = 90
+        for i in range(icf_idx):
+            lag_key = f"{ordered_stages[i]} -> {ordered_stages[i+1]}"
+            total_lag_to_icf += inter_stage_lags.get(lag_key, 30) # Default to 30 days if lag is missing
+    except (ValueError, IndexError): total_lag_to_icf = 90 # Fallback lag
 
     last_hist = _processed_df["Submission_Month"].max() if "Submission_Month" in _processed_df else pd.Period(datetime.now(),'M')-1
     start_month = last_hist + 1
@@ -246,28 +264,36 @@ def calculate_projections(_processed_df, ordered_stages, ts_col_map, proj_inputs
     cohorts['CPQR'] = [assumed_cpqr.get(m, 120) for m in future_months]
     cohorts['New_QLs'] = (cohorts['Ad_Spend']/cohorts['CPQR'].replace(0,np.nan)).fillna(0).round().astype(int)
 
+    # Calculate ICFs generated from these new QLs
     counts = cohorts['New_QLs'].copy()
     if 'icf_idx' in locals() and icf_idx > 0:
-        for i in range(icf_idx): counts *= conv_rates.get(f"{ordered_stages[i]} -> {ordered_stages[i+1]}", 0)
+        for i in range(icf_idx):
+            rate_key = f"{ordered_stages[i]} -> {ordered_stages[i+1]}"
+            counts *= conv_rates.get(rate_key, 0)
     cohorts['Generated_ICFs'] = counts
 
-    max_land = future_months[-1] + int(np.ceil(total_lag / 30.5)) + 1
-    results_idx = pd.period_range(start=start_month, end=max_land, freq='M')
-    results = pd.DataFrame(0.0, index=results_idx, columns=['Projected_ICF_Landed'])
+    # Smear the generated ICFs into future landing months based on lag
+    max_land_month = future_months[-1] + int(np.ceil(total_lag_to_icf / 30.5)) + 2
+    results_idx = pd.period_range(start=start_month, end=max_land_month, freq='M')
+    results = pd.DataFrame(0.0, index=results_idx, columns=['ICFs from New Leads'])
     
     for month, row in cohorts.iterrows():
         if row['Generated_ICFs'] <= 0: continue
-        full_lag_m, rem_days = divmod(total_lag, 30.4375)
-        frac_next = rem_days / 30.4375
+        full_lag_months, rem_days = divmod(total_lag_to_icf, 30.4375)
+        frac_for_next_month = rem_days / 30.4375
         
-        land1, land2 = month + int(full_lag_m), month + int(full_lag_m) + 1
-        if land1 in results.index: results.loc[land1, 'Projected_ICF_Landed'] += row['Generated_ICFs'] * (1 - frac_next)
-        if land2 in results.index: results.loc[land2, 'Projected_ICF_Landed'] += row['Generated_ICFs'] * frac_next
+        land_month_1 = month + int(full_lag_months)
+        land_month_2 = month + int(full_lag_months) + 1
+        if land_month_1 in results.index:
+            results.loc[land_month_1, 'ICFs from New Leads'] += row['Generated_ICFs'] * (1 - frac_for_next_month)
+        if land_month_2 in results.index:
+            results.loc[land_month_2, 'ICFs from New Leads'] += row['Generated_ICFs'] * frac_for_next_month
             
-    return results.reindex(future_months).fillna(0).round().astype(int)
+    return results.reindex(future_months).fillna(0)
 
 @st.cache_data
 def calculate_pipeline_projection(_processed_df, ordered_stages, ts_col_map, inter_stage_lags, conv_rates):
+    """Calculates future ICFs and Enrollments from EXISTING in-flight leads."""
     if _processed_df is None: return {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0}
 
     term_ts = [ts_col_map.get(s) for s in [STAGE_ENROLLED, STAGE_SCREEN_FAILED, STAGE_LOST] if s in ts_col_map]
@@ -292,32 +318,74 @@ def calculate_pipeline_projection(_processed_df, ordered_stages, ts_col_map, int
     if icf_idx == -1: return {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0}
 
     for _, row in in_flight.iterrows():
-        prob, lag = 1.0, 0.0
+        prob_to_icf, lag_to_icf = 1.0, 0.0
         start_idx = ordered_stages.index(row['curr_s'])
-        for i in range(start_idx, icf_idx):
-            f, t = ordered_stages[i], ordered_stages[i+1]
-            prob *= conv_rates.get(f"{f} -> {t}", 0)
-            lag += inter_stage_lags.get(f"{f} -> {t}", 0)
         
-        if prob > 0:
-            icf_d = row['curr_t'] + pd.to_timedelta(lag, unit='D')
-            prob_e = prob * conv_rates.get(f"{STAGE_SIGNED_ICF} -> {STAGE_ENROLLED}",0)
-            lag_e = inter_stage_lags.get(f"{STAGE_SIGNED_ICF} -> {STAGE_ENROLLED}",0)
-            enr_d = icf_d + pd.to_timedelta(lag_e, unit='D')
-            projs.append({'icf_p':prob, 'icf_d':icf_d, 'enr_p':prob_e, 'enr_d':enr_d})
+        path_found = False
+        for i in range(start_idx, len(ordered_stages)-1):
+            f, t = ordered_stages[i], ordered_stages[i+1]
+            prob_to_icf *= conv_rates.get(f"{f} -> {t}", 0)
+            lag_to_icf += inter_stage_lags.get(f"{f} -> {t}", 0)
+            if t == STAGE_SIGNED_ICF:
+                path_found = True
+                break
+        
+        if path_found and prob_to_icf > 0 and pd.notna(row['curr_t']):
+            icf_date = row['curr_t'] + pd.to_timedelta(lag_to_icf, unit='D')
+            prob_to_enroll = prob_to_icf * conv_rates.get(f"{STAGE_SIGNED_ICF} -> {STAGE_ENROLLED}",0)
+            lag_to_enroll = inter_stage_lags.get(f"{STAGE_SIGNED_ICF} -> {STAGE_ENROLLED}",0)
+            enroll_date = icf_date + pd.to_timedelta(lag_to_enroll, unit='D') if pd.notna(icf_date) else pd.NaT
+            projs.append({'icf_prob':prob_to_icf, 'icf_date':icf_date, 'enroll_prob':prob_to_enroll, 'enroll_date':enroll_date})
     
     if not projs: return {'results_df': pd.DataFrame(), 'total_icf_yield': 0, 'total_enroll_yield': 0}
 
     proj_df = pd.DataFrame(projs)
-    max_d = proj_df[['icf_d', 'enr_d']].max().max() if not proj_df.empty else datetime.now()
+    max_d = proj_df[['icf_date', 'enroll_date']].max().max() if not proj_df.empty else datetime.now()
     start_p, end_p = pd.Period(datetime.now(),'M'), max(pd.Period(max_d,'M'), pd.Period(datetime.now(),'M')+11)
     res_idx = pd.period_range(start=start_p, end=end_p, freq='M')
-    res_df = pd.DataFrame(0.0, index=res_idx, columns=['Projected_ICF_Landed', 'Projected_Enrollments_Landed'])
+    res_df = pd.DataFrame(0.0, index=res_idx, columns=['ICFs from Pipeline', 'Enrollments from Pipeline'])
 
-    res_df['Projected_ICF_Landed'] = res_df.index.map(proj_df.groupby(proj_df['icf_d'].dt.to_period('M'))['icf_p'].sum())
-    res_df['Projected_Enrollments_Landed'] = res_df.index.map(proj_df.groupby(proj_df['enr_d'].dt.to_period('M'))['enr_p'].sum())
+    res_df['ICFs from Pipeline'] = res_df.index.map(proj_df.groupby(proj_df['icf_date'].dt.to_period('M'))['icf_prob'].sum())
+    res_df['Enrollments from Pipeline'] = res_df.index.map(proj_df.groupby(proj_df['enroll_date'].dt.to_period('M'))['enroll_prob'].sum())
     
-    return {'results_df':res_df.fillna(0),'total_icf_yield':proj_df['icf_p'].sum(),'total_enroll_yield':proj_df['enr_p'].sum()}
+    return {'results_df':res_df.fillna(0),'total_icf_yield':proj_df['icf_prob'].sum(),'total_enroll_yield':proj_df['enroll_prob'].sum()}
+
+def calculate_combined_forecast(processed_df, ordered_stages, ts_col_map, inter_stage_lags, proj_inputs, funnel_conv_rates):
+    """
+    Orchestrates the calculation of future projections from both new and existing leads.
+    This is the new function that was missing.
+    """
+    # 1. Get projections from new leads (future ad spend)
+    new_leads_df = calculate_projections_from_new_leads(
+        processed_df, ordered_stages, ts_col_map, proj_inputs
+    )
+
+    # 2. Get projections from existing leads (in-flight pipeline)
+    pipeline_results = calculate_pipeline_projection(
+        processed_df, ordered_stages, ts_col_map, inter_stage_lags, funnel_conv_rates
+    )
+    pipeline_df = pipeline_results['results_df']
+
+    # 3. Combine the two future projections
+    combined_df = pd.concat([new_leads_df, pipeline_df], axis=1).fillna(0)
+    
+    # 4. Create the total column
+    if 'ICFs from New Leads' in combined_df.columns and 'ICFs from Pipeline' in combined_df.columns:
+        combined_df['Total Projected ICFs'] = combined_df['ICFs from New Leads'] + combined_df['ICFs from Pipeline']
+    elif 'ICFs from New Leads' in combined_df.columns:
+        combined_df['Total Projected ICFs'] = combined_df['ICFs from New Leads']
+    elif 'ICFs from Pipeline' in combined_df.columns:
+        combined_df['Total Projected ICFs'] = combined_df['ICFs from Pipeline']
+    else:
+        combined_df['Total Projected ICFs'] = 0
+
+    return {
+        'combined_df': combined_df,
+        'total_new_lead_icfs': new_leads_df['ICFs from New Leads'].sum(),
+        'total_pipeline_icf_yield': pipeline_results['total_icf_yield'],
+        'total_pipeline_enroll_yield': pipeline_results['total_enroll_yield']
+    }
+
 
 # --- 4. Streamlit UI and Application Logic ---
 
@@ -392,36 +460,41 @@ else:
     st.markdown("---")
 
     if st.button("🚀 Run Combined Forecast", key="run_forecast"):
-        # Determine effective rates
+        # 1. Determine effective conversion rates for the projections
         effective_rates, rates_method_desc = determine_effective_projection_rates(
             st.session_state.processed_df, st.session_state.ordered_stages, st.session_state.ts_col_map,
             rate_method, rolling_window, manual_rates)
         st.session_state.rates_desc = rates_method_desc
         
-        # Calculate historical part
-        historical_start_month = _proj_start_month - history_months
-        historical_months_range = pd.period_range(start=historical_start_month, end=_proj_start_month - 1, freq='M')
-        historical_df = calculate_historical_performance(st.session_state.processed_df, historical_months_range, st.session_state.ts_col_map)
-        historical_df.rename(columns={'Historical ICFs Landed': 'Total Projected ICFs', 'Historical Enrollments Landed': 'Enrollments from Pipeline'}, inplace=True)
+        # 2. Calculate the historical part of the timeline
+        historical_df = calculate_historical_performance(
+            st.session_state.processed_df, st.session_state.ts_col_map,
+            history_months, _proj_start_month
+        )
         
-        # Calculate future part
-        proj_inputs = {'horizon':proj_horizon,'spend_dict':proj_spend_dict,'cpqr_dict':proj_cpqr_dict,'final_conv_rates':effective_rates,'inter_stage_lags':st.session_state.inter_stage_lags}
-        funnel_inputs = {'final_conv_rates': effective_rates}
-        future_results = calculate_combined_forecast(st.session_state.processed_df, st.session_state.ordered_stages, st.session_state.ts_col_map, st.session_state.inter_stage_lags, proj_inputs, funnel_inputs)
+        # 3. Calculate the future part of the timeline (from both new and existing leads)
+        proj_inputs = {
+            'horizon': proj_horizon, 'spend_dict': proj_spend_dict, 'cpqr_dict': proj_cpqr_dict,
+            'final_conv_rates': effective_rates, 'inter_stage_lags': st.session_state.inter_stage_lags
+        }
+        future_results = calculate_combined_forecast(
+            st.session_state.processed_df, st.session_state.ordered_stages, st.session_state.ts_col_map,
+            st.session_state.inter_stage_lags, proj_inputs, effective_rates
+        )
         future_df = future_results['combined_df']
-        st.session_state.future_results_cache = future_results # Cache for metrics
+        st.session_state.future_results_cache = future_results  # Cache for metrics
 
-        # Combine historical and future data
+        # 4. Combine historical and future data into one DataFrame
         full_timeline_df = pd.concat([historical_df, future_df]).fillna(0)
         
-        # Ensure all columns exist and are in order
+        # 5. Ensure all columns exist and are in the correct order, then cast to integer
         all_cols = ['ICFs from New Leads', 'ICFs from Pipeline', 'Total Projected ICFs', 'Enrollments from Pipeline']
         for col in all_cols:
-            if col not in full_timeline_df.columns: full_timeline_df[col] = 0
+            if col not in full_timeline_df.columns:
+                full_timeline_df[col] = 0
+        full_timeline_df = full_timeline_df[all_cols].astype(int)
         
-        full_timeline_df = full_timeline_df.astype(int)
-        
-        # Recalculate cumulative sums on the full timeline
+        # 6. Recalculate cumulative sums on the complete, unified timeline
         full_timeline_df['Cumulative ICFs'] = full_timeline_df['Total Projected ICFs'].cumsum()
         full_timeline_df['Cumulative Enrollments'] = full_timeline_df['Enrollments from Pipeline'].cumsum()
         
