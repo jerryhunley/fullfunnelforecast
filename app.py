@@ -157,7 +157,7 @@ def determine_effective_projection_rates(_processed_df, ordered_stages, ts_col_m
         for stage in ordered_stages:
             ts = ts_col_map.get(stage)
             if ts and ts in _processed_df.columns:
-                col = f"Reached_{stage.replace(' ', '_')}"
+                col = f"Reached_{stage.replace(' ', '_').replace('(', '').replace(')', '')}"
                 hist_counts[col] = _processed_df.dropna(subset=[ts]).groupby('Submission_Month').size()
         hist_counts = hist_counts.fillna(0)
 
@@ -165,26 +165,36 @@ def determine_effective_projection_rates(_processed_df, ordered_stages, ts_col_m
         for key, manual_val in manual_rates.items():
             try: from_s, to_s = key.split(" -> ")
             except ValueError: continue
-            col_f, col_t = f"Reached_{from_s.replace(' ', '_')}", f"Reached_{to_s.replace(' ', '_')}"
+            col_f = f"Reached_{from_s.replace(' ', '_').replace('(', '').replace(')', '')}"
+            col_t = f"Reached_{to_s.replace(' ', '_').replace('(', '').replace(')', '')}"
             
             if col_f not in hist_counts.columns or col_t not in hist_counts.columns:
                 calculated_rates[key] = manual_val; continue
 
             mature_counts = hist_counts[hist_counts.index.to_timestamp() + pd.Timedelta(days=maturity_days.get(key, 45)) < pd.Timestamp(datetime.now())]
+            
+            # --- CRITICAL FIX: The final fallback is always the user's manual input ---
+            final_fallback_rate = manual_val
+            
             if mature_counts.empty:
-                calculated_rates[key] = manual_val; continue
+                calculated_rates[key] = final_fallback_rate; continue
 
             overall_rate = (mature_counts[col_t].sum() / mature_counts[col_f].sum()) if mature_counts[col_f].sum() >= 20 else np.nan
-            fallback = overall_rate if pd.notna(overall_rate) else manual_val
             
-            monthly = (mature_counts[col_t] / mature_counts[col_f].replace(0, np.nan))
-            final_monthly = monthly.where(mature_counts[col_f] >= 5, fallback).dropna()
+            monthly_rates = (mature_counts[col_t] / mature_counts[col_f].replace(0, np.nan))
+            monthly_rates_with_fallback = monthly_rates.where(mature_counts[col_f] >= 5, overall_rate if pd.notna(overall_rate) else np.nan).dropna()
 
-            if not final_monthly.empty:
-                win = min(rolling_window, len(final_monthly)) if rolling_window != 999 else len(final_monthly)
-                if win > 0: calculated_rates[key] = final_monthly.rolling(win, min_periods=1).mean().iloc[-1]
-                else: calculated_rates[key] = fallback
-            else: calculated_rates[key] = fallback
+            if not monthly_rates_with_fallback.empty:
+                win = min(rolling_window, len(monthly_rates_with_fallback)) if rolling_window != 999 else len(monthly_rates_with_fallback)
+                if win > 0:
+                    rolling_avg = monthly_rates_with_fallback.rolling(win, min_periods=1).mean().iloc[-1]
+                    # Use the calculated rate only if it's a valid, positive number
+                    if pd.notna(rolling_avg) and rolling_avg > 0:
+                        calculated_rates[key] = rolling_avg
+                    else:
+                        calculated_rates[key] = final_fallback_rate
+                else: calculated_rates[key] = final_fallback_rate
+            else: calculated_rates[key] = final_fallback_rate
                 
         desc = f"Rolling {rolling_window}-Month Avg (Matured)" if rolling_window != 999 else "Overall Historical Average (Matured)"
         return calculated_rates, desc
@@ -272,8 +282,9 @@ def calculate_pipeline_projection(_processed_df, ordered_stages, ts_col_map, int
     
     if not projs: return default
     proj_df = pd.DataFrame(projs)
-    max_d = proj_df[['id', 'ed']].max().max()
-    res_idx = pd.period_range(start=datetime.now(), end=max_d, freq='M')
+    max_d = proj_df[['id', 'ed']].max().max() if not proj_df.empty else datetime.now()
+    end_p = max(pd.Period(max_d, 'M'), pd.Period(datetime.now(), 'M') + 24)
+    res_idx = pd.period_range(start=datetime.now(), end=end_p, freq='M')
     res = pd.DataFrame(0.0, index=res_idx, columns=['ICFs from Pipeline', 'Enrollments from Pipeline'])
     res['ICFs from Pipeline'] = res.index.map(proj_df.groupby(proj_df['id'].dt.to_period('M'))['ip'].sum())
     res['Enrollments from Pipeline'] = res.index.map(proj_df.groupby(proj_df['ed'].dt.to_period('M'))['ep'].sum())
@@ -382,7 +393,7 @@ if st.session_state.get('data_processed', False):
 
         st.subheader("Historical & Projected Monthly View")
         display = results.copy()
-        display.index = display.index.strftime('%Y-%m')
+        if isinstance(display.index, pd.PeriodIndex): display.index = display.index.strftime('%Y-%m')
         display.index.name = "Month"
         st.dataframe(display[all_cols].style.format("{:,.0f}"))
 
