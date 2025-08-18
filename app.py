@@ -618,13 +618,13 @@ if ref_csv and funnel_csv:
                 default = defaults.get(f"{a} -> {b}", 0.0) * 100
                 eff_rates[f"{a} -> {b}"] = cols[i%3].slider(f"{a} → {b}", 0.0, 100.0, round(default, 1), 0.1) / 100
 
-       if st.button("🚀 Run Combined Calculation"):
-           # Identify terminal stages
-           terminal_extras = []
-           for stage in ordered:
-               stage_lower = stage.lower()
-               if any(term in stage_lower for term in ["screen fail", "lost", "withdrawn", "discontinued", "screen failed"]):
-                   terminal_extras.append(stage)
+        if st.button("🚀 Run Combined Calculation"):
+            # Identify terminal stages
+            terminal_extras = []
+            for stage in ordered:
+                stage_lower = stage.lower()
+                if any(term in stage_lower for term in ["screen fail", "lost", "withdrawn", "discontinued", "screen failed"]):
+                    terminal_extras.append(stage)
            
            # Run pipeline projection
            pipe_res = pipeline_projection(df, ordered, ts_map, eff_rates, lags, icf_stage, final_stage, terminal_extras)
