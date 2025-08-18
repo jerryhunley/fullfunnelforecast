@@ -625,17 +625,17 @@ if ref_csv and funnel_csv:
                 stage_lower = stage.lower()
                 if any(term in stage_lower for term in ["screen fail", "lost", "withdrawn", "discontinued", "screen failed"]):
                     terminal_extras.append(stage)
-           
-           # Run pipeline projection
-           pipe_res = pipeline_projection(df, ordered, ts_map, eff_rates, lags, icf_stage, final_stage, terminal_extras)
-           
-           # Run new leads projection
-           new_df = projections_new_leads(df, ordered, ts_map, horizon, spend_dict, cpqr_dict, eff_rates, lags, icf_stage, final_stage)
-           
-           # Combine results
-           combined = combine_monthly_tables(pipe_res['results_df'], new_df, final_stage)
+            
+            # Run pipeline projection
+            pipe_res = pipeline_projection(df, ordered, ts_map, eff_rates, lags, icf_stage, final_stage, terminal_extras)
+            
+            # Run new leads projection
+            new_df = projections_new_leads(df, ordered, ts_map, horizon, spend_dict, cpqr_dict, eff_rates, lags, icf_stage, final_stage)
+            
+            # Combine results
+            combined = combine_monthly_tables(pipe_res['results_df'], new_df, final_stage)
 
-           st.success("✅ Calculation complete!")
+            st.success("✅ Calculation complete!")
            
            # Display summary metrics
            col1, col2, col3 = st.columns(3)
